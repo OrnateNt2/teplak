@@ -54,42 +54,47 @@ def main_loop():
         mvsdk.CameraSetTriggerMode(hCamera, 0)
     elif mode == "2":
         print("Режим аппаратного внешнего триггера выбран.")
-        # Устанавливаем внешний триггерный режим
         ret = mvsdk.CameraSetTriggerMode(hCamera, 1)
         if ret != 0:
             print(f"Ошибка установки режима внешнего триггера: {ret}")
             mvsdk.CameraUnInit(hCamera)
             return
 
-        # Устанавливаем тип внешнего триггера.
-        # Введите тип сигнала: 0 - LEADING_EDGE, 1 - TRAILING_EDGE,
-        # 2 - HIGH_LEVEL, 3 - LOW_LEVEL, 4 - DOUBLE_EDGE (по умолчанию 2)
-        extTrigType = input("Введите тип внешнего триггера (0: LEADING_EDGE, 1: TRAILING_EDGE, 2: HIGH_LEVEL, 3: LOW_LEVEL, 4: DOUBLE_EDGE) (по умолчанию 2): ")
+        # Запрашиваем тип внешнего триггера
+        print("Тип внешнего триггера:")
+        print("  0 - LEADING_EDGE")
+        print("  1 - TRAILING_EDGE")
+        print("  2 - HIGH_LEVEL (по умолчанию)")
+        print("  3 - LOW_LEVEL")
+        print("  4 - DOUBLE_EDGE")
+        extTrigType = input("Введите тип внешнего триггера (0-4, по умолчанию 2): ")
         extTrigType = int(extTrigType) if extTrigType.strip() != "" else 2
         ret = mvsdk.CameraSetExtTrigSignalType(hCamera, extTrigType)
         if ret != 0:
             print(f"Ошибка установки типа внешнего триггера: {ret}")
-        # Устанавливаем тип срабатывания затвора; здесь используем тот же тип, что и сигнал триггера
         ret = mvsdk.CameraSetExtTrigShutterType(hCamera, extTrigType)
         if ret != 0:
             print(f"Ошибка установки типа срабатывания затвора: {ret}")
-        # Устанавливаем внешнюю задержку триггера (в микросекундах)
+
+        # Устанавливаем внешнюю задержку триггера
         extTrigDelay = input_int("Введите внешнюю задержку триггера (us)", 0)
         ret = mvsdk.CameraSetExtTrigDelayTime(hCamera, extTrigDelay)
         if ret != 0:
             print(f"Ошибка установки внешней задержки триггера: {ret}")
-        # Устанавливаем интервал внешнего триггера (если требуется; 0 - по умолчанию)
+
+        # Устанавливаем интервал внешнего триггера (если требуется)
         intervalTime = input_int("Введите interval time (us) (0 по умолчанию)", 0)
         ret = mvsdk.CameraSetExtTrigIntervalTime(hCamera, intervalTime)
         if ret != 0:
             print(f"Ошибка установки interval time: {ret}")
-        # Устанавливаем время подавления дребезга (jitter time, us)
+
+        # Устанавливаем время подавления дребезга
         jitterTime = input_int("Введите jitter time (us) (0 по умолчанию)", 0)
         ret = mvsdk.CameraSetExtTrigJitterTime(hCamera, jitterTime)
         if ret != 0:
             print(f"Ошибка установки jitter time: {ret}")
 
-        # Запрос параметров захвата триггера
+        # Запрашиваем параметры захвата: Trigger Count и Trigger Delay (кадровый)
         trig_count = input_int("Введите Trigger Count (рекомендуется 2): ", 2)
         trig_delay = input_int("Введите Trigger Delay (us) (например, 12500): ", 12500)
         ret = mvsdk.CameraSetTriggerCount(hCamera, trig_count)
@@ -133,7 +138,7 @@ def main_loop():
                 frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth))
             else:
                 frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, 3))
-            frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
+            frame = cv2.resize(frame, (640,480), interpolation=cv2.INTER_LINEAR)
             cv2.imshow("Press q to end", frame)
         except mvsdk.CameraException as e:
             if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:

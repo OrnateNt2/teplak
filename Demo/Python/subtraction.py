@@ -8,22 +8,18 @@ import ctypes
 import numpy as np
 import cv2
 
-# Глобальные переменные для передачи обработанного кадра и FPS
 current_image = None
 fps = 0
 running = True
 
-# Глобальная переменная для дескриптора камеры
 hCamera = None
 
-# Функция захвата двух последовательных кадров и вычитания
 def capture_loop():
     global current_image, fps, running, hCamera
     frame_count = 0
     start_time = time.time()
     while running:
         try:
-            # Получаем первый кадр (предположительно с лазерной подсветкой)
             buffer1, frameInfo1 = mvsdk.CameraGetImageBuffer(hCamera, 1000)
         except Exception as e:
             print("Ошибка получения первого кадра:", e)

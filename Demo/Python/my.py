@@ -7,22 +7,18 @@ import mvsdk
 import ctypes
 import numpy as np
 
-# Глобальные переменные для передачи кадра и FPS
 current_image = None
 fps = 0
 running = True
 
-# Глобальная переменная для дескриптора камеры
 hCamera = None
 
-# Функция захвата кадров в отдельном потоке
 def capture_loop():
     global current_image, fps, running, hCamera
     frame_count = 0
     start_time = time.time()
     while running:
         try:
-            # Получаем кадр с таймаутом 1000 мс
             buffer, frameInfo = mvsdk.CameraGetImageBuffer(hCamera, 1000)
         except Exception as e:
             print("Ошибка получения кадра:", e)

@@ -103,7 +103,7 @@ def main_loop():
 		print("{}: {} {}".format(i, DevInfo.GetFriendlyName(), DevInfo.GetPortType()))
 
 	cams = []
-	for i in map(lambda x: int(x), raw_input("Select cameras: ").split()):
+	for i in map(lambda x: int(x), input("Select cameras: ").split()):
 		cam = Camera(DevList[i])
 		if cam.open():
 			cams.append(cam)

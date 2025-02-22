@@ -3,61 +3,20 @@ import cv2
 import numpy as np
 import mvsdk
 import platform
-import tkinter as tk
-from tkinter import ttk
-
-def apply_trigger_settings(hCamera, trig_count_var, trig_delay_var):
-    """
-    Применяет настройки внешнего триггера:
-      - Trigger Count: количество кадров на один импульс
-      - Trigger Delay (us): задержка в микросекундах перед захватом кадра
-    """
-    try:
-        count_val = int(trig_count_var.get())
-        delay_val = int(trig_delay_var.get())
-    except Exception as e:
-        print("Ошибка ввода значений триггера:", e)
-        return
-
-    ret1 = mvsdk.CameraSetTriggerCount(hCamera, count_val)
-    ret2 = mvsdk.CameraSetTriggerDelayTime(hCamera, delay_val)
-    if ret1 != 0 or ret2 != 0:
-        print("Ошибка установки параметров триггера (ret1={}, ret2={})".format(ret1, ret2))
-    else:
-        print("Параметры триггера успешно установлены:")
-        print(f"  Trigger Count = {count_val}, Trigger Delay = {delay_val} us")
-
-def show_trigger_settings_window(hCamera):
-    """ Открывает окно для ручной настройки параметров внешнего триггера """
-    win = tk.Tk()
-    win.title("Настройки внешнего триггера (hardware)")
-
-    trig_count_var = tk.StringVar(value="2")
-    trig_delay_var = tk.StringVar(value="12500")  # Пример для лазера 20 Гц
-
-    ttk.Label(win, text="Trigger Count:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-    ttk.Entry(win, textvariable=trig_count_var, width=10).grid(row=0, column=1, padx=5, pady=5)
-
-    ttk.Label(win, text="Trigger Delay (us):").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-    ttk.Entry(win, textvariable=trig_delay_var, width=10).grid(row=1, column=1, padx=5, pady=5)
-
-    ttk.Button(win, text="Применить", 
-               command=lambda: apply_trigger_settings(hCamera, trig_count_var, trig_delay_var)
-              ).grid(row=2, column=0, columnspan=2, padx=5, pady=10)
-
-    win.mainloop()
+import time
 
 def main_loop():
-    # Перечисляем камеры
+    # Перечисление камер
     DevList = mvsdk.CameraEnumerateDevice()
     nDev = len(DevList)
     if nDev < 1:
-        print("No camera was found!")
+        print("Камера не найдена!")
         return
 
+    # Вывод списка камер
     for i, DevInfo in enumerate(DevList):
         print("{}: {} {}".format(i, DevInfo.GetFriendlyName(), DevInfo.GetPortType()))
-    idx = 0 if nDev == 1 else int(input("Select camera (index): "))
+    idx = 0 if nDev == 1 else int(input("Выберите камеру (индекс): "))
     DevInfo = DevList[idx]
     print("Выбрана камера:")
     print(DevInfo)
@@ -67,10 +26,10 @@ def main_loop():
     try:
         hCamera = mvsdk.CameraInitEx2(cameraName)
     except mvsdk.CameraException as e:
-        print("CameraInitEx2 Failed({}): {}".format(e.error_code, e.message))
+        print("Ошибка инициализации CameraInitEx2 ({}): {}".format(e.error_code, e.message))
         return
 
-    # Получаем характеристики камеры
+    # Получаем характеристики камеры и устанавливаем формат ISP
     cap = mvsdk.CameraGetCapability(hCamera)
     monoCamera = (cap.sIspCapacity.bMonoSensor != 0)
     if monoCamera:
@@ -81,55 +40,72 @@ def main_loop():
     # Выбор режима работы
     print("\nВыберите режим работы камеры:")
     print("1 - Непрерывный захват (без внешнего триггера)")
-    print("2 - Внешний аппаратный триггер (ByName, hardware trigger)")
+    print("2 - Аппаратный внешний триггер")
     mode = input("Введите номер режима (1 или 2): ")
-
     if mode == "1":
         print("Режим непрерывного захвата выбран.")
-        mvsdk.CameraSetTriggerMode(hCamera, 0)
+        mvsdk.CameraSetTriggerMode(hCamera, 0)  # Непрерывный режим
     elif mode == "2":
-        print("Режим внешнего аппаратного триггера выбран.")
+        print("Режим аппаратного внешнего триггера выбран.")
         # Устанавливаем режим внешнего триггера
         ret = mvsdk.CameraSetTriggerMode(hCamera, 1)
         if ret != 0:
-            print("Ошибка установки режима триггера:", ret)
+            print("Ошибка установки режима внешнего триггера: {}".format(ret))
             mvsdk.CameraUnInit(hCamera)
             return
-        # Устанавливаем тип внешнего триггера – попробуйте EXT_TRIG_HIGH_LEVEL или EXT_TRIG_LOW_LEVEL,
-        # в зависимости от уровня вашего импульса.
+
+        # Устанавливаем тип внешнего триггера.
+        # Если внешний сигнал на камере имеет высокий уровень при срабатывании, используйте EXT_TRIG_HIGH_LEVEL,
+        # иначе EXT_TRIG_LOW_LEVEL.
         ret = mvsdk.CameraSetExtTrigSignalType(hCamera, mvsdk.EXT_TRIG_HIGH_LEVEL)
         if ret != 0:
-            print("Ошибка установки типа внешнего триггера:", ret)
-        # Устанавливаем тип срабатывания затвора (если требуется)
+            print("Ошибка установки типа внешнего триггера: {}".format(ret))
+        # Устанавливаем тип срабатывания затвора; в данном примере также используем HIGH_LEVEL.
         ret = mvsdk.CameraSetExtTrigShutterType(hCamera, mvsdk.EXT_TRIG_HIGH_LEVEL)
         if ret != 0:
-            print("Ошибка установки типа срабатывания затвора:", ret)
-        # Можно установить задержку внешнего триггера, если требуется (например, 0)
+            print("Ошибка установки типа срабатывания затвора: {}".format(ret))
+        # Устанавливаем внешнюю задержку триггера – здесь можно попробовать 0.
         ret = mvsdk.CameraSetExtTrigDelayTime(hCamera, 0)
         if ret != 0:
-            print("Ошибка установки внешней задержки триггера:", ret)
-        # Открываем окно для ручной настройки Trigger Count и Trigger Delay
-        show_trigger_settings_window(hCamera)
+            print("Ошибка установки внешней задержки триггера: {}".format(ret))
+
+        # Запрос параметров триггера из консоли
+        try:
+            trig_count = int(input("Введите Trigger Count (например, 2): "))
+            trig_delay = int(input("Введите Trigger Delay (us) (например, 12500): "))
+        except Exception as e:
+            print("Неверный ввод параметров: ", e)
+            mvsdk.CameraUnInit(hCamera)
+            return
+
+        ret = mvsdk.CameraSetTriggerCount(hCamera, trig_count)
+        if ret != 0:
+            print("Ошибка установки Trigger Count: {}".format(ret))
+        ret = mvsdk.CameraSetTriggerDelayTime(hCamera, trig_delay)
+        if ret != 0:
+            print("Ошибка установки Trigger Delay: {}".format(ret))
+        print("Параметры внешнего триггера установлены:")
+        print("  Trigger Count = {}, Trigger Delay = {} us".format(trig_count, trig_delay))
     else:
         print("Некорректный выбор режима. Выход.")
         mvsdk.CameraUnInit(hCamera)
         return
 
-    # Настройка экспозиции (ручной режим, 30 мс)
+    # Настройка экспозиции: ручной режим, 30 мс
     mvsdk.CameraSetAeState(hCamera, 0)
     mvsdk.CameraSetExposureTime(hCamera, 30 * 1000)
 
     # Запускаем захват изображений
     mvsdk.CameraPlay(hCamera)
 
-    # Вычисляем размер буфера для изображения
+    # Выделяем буфер для изображения (RGB или MONO)
     FrameBufferSize = cap.sResolutionRange.iWidthMax * cap.sResolutionRange.iHeightMax * (1 if monoCamera else 3)
     pFrameBuffer = mvsdk.CameraAlignMalloc(FrameBufferSize, 16)
 
     print("Нажмите 'q' для выхода.")
     while (cv2.waitKey(1) & 0xFF) != ord('q'):
         try:
-            # Увеличиваем timeout до 2000 мс
+            # Устанавливаем timeout 2000 мс (при аппаратном триггере может потребоваться больше времени)
             pRawData, FrameHead = mvsdk.CameraGetImageBuffer(hCamera, 2000)
             mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
             mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
@@ -151,6 +127,7 @@ def main_loop():
             else:
                 print("Time out, повторяем попытку...")
 
+    # Завершаем работу: деинициализация камеры и освобождение буфера
     mvsdk.CameraUnInit(hCamera)
     mvsdk.CameraAlignFree(pFrameBuffer)
 

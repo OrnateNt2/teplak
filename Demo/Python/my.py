@@ -29,26 +29,21 @@ def capture_loop():
             continue
 
         size = frameInfo.uBytes
-        # Преобразуем буфер в numpy-массив
         image_buffer = (ctypes.c_ubyte * size).from_address(buffer)
         arr = np.ctypeslib.as_array(image_buffer)
         # Определяем формат изображения
         if size == frameInfo.iWidth * frameInfo.iHeight:
-            # Изображение в градациях серого
             img_np = arr.reshape((frameInfo.iHeight, frameInfo.iWidth))
             mode = "L"
         elif size == frameInfo.iWidth * frameInfo.iHeight * 3:
-            # Цветное изображение (предполагается формат RGB)
             img_np = arr.reshape((frameInfo.iHeight, frameInfo.iWidth, 3))
             mode = "RGB"
         else:
             mvsdk.CameraReleaseImageBuffer(hCamera, buffer)
             continue
 
-        # Освобождаем буфер
         mvsdk.CameraReleaseImageBuffer(hCamera, buffer)
 
-        # Конвертируем массив в PIL Image
         try:
             pil_img = Image.fromarray(img_np, mode=mode)
         except Exception as e:
@@ -63,34 +58,36 @@ def capture_loop():
             frame_count = 0
             start_time = time.time()
 
-        # Сохраняем последний кадр (копия для избежания конфликтов)
         current_image = pil_img.copy()
 
-# Функция обновления изображения в tkinter (вызывается через after)
+# Функция обновления изображения в tkinter
 def update_image():
     global current_image, fps
     if current_image is not None:
-        # Копируем изображение и накладываем текст
         img_with_overlay = current_image.copy()
         draw = ImageDraw.Draw(img_with_overlay)
-        # Получаем значения из полей управления
         try:
             trig_count = trigger_count_var.get()
             trig_delay = trigger_delay_var.get()
             trig_interval = trigger_interval_var.get()
+            laser_freq = laser_freq_var.get()
+            camera_freq = camera_freq_var.get()
         except Exception:
-            trig_count = trig_delay = trig_interval = "N/A"
-        overlay_text = f"FPS: {fps:.2f}\nRes: {img_with_overlay.width}x{img_with_overlay.height}\n" \
-                       f"Trigger Count: {trig_count}\nDelay: {trig_delay} us\nInterval: {trig_interval} us"
-        # Рисуем текст в левом верхнем углу
+            trig_count = trig_delay = trig_interval = laser_freq = camera_freq = "N/A"
+        overlay_text = (f"FPS: {fps:.2f}\n"
+                        f"Res: {img_with_overlay.width}x{img_with_overlay.height}\n"
+                        f"Trigger Count: {trig_count}\n"
+                        f"Delay: {trig_delay} us\n"
+                        f"Interval: {trig_interval} us\n"
+                        f"Laser f: {laser_freq} Hz\n"
+                        f"Camera f: {camera_freq} Hz")
         draw.text((10, 10), overlay_text, fill="green")
-        # Преобразуем в ImageTk для отображения в Label
         imgtk = ImageTk.PhotoImage(img_with_overlay)
         video_label.imgtk = imgtk
         video_label.config(image=imgtk)
     root.after(30, update_image)
 
-# Функция применения настроек триггера
+# Функция применения настроек триггера вручную
 def apply_trigger_settings():
     global hCamera
     try:
@@ -103,13 +100,43 @@ def apply_trigger_settings():
 
     ret1 = mvsdk.CameraSetTriggerCount(hCamera, count_val)
     ret2 = mvsdk.CameraSetTriggerDelayTime(hCamera, delay_val)
-    # Используем CameraSetExtTrigJitterTime для установки интервала между срабатываниями триггера
     ret3 = mvsdk.CameraSetExtTrigJitterTime(hCamera, interval_val)
 
     if ret1 != 0 or ret2 != 0 or ret3 != 0:
-        print("Ошибка установки параметров триггера (ret1={}, ret2={}, ret3={})".format(ret1, ret2, ret3))
+        print(f"Ошибка установки параметров триггера (ret1={ret1}, ret2={ret2}, ret3={ret3})")
     else:
         print("Параметры триггера успешно установлены")
+
+# Функция расчёта параметров триггера по заданным частотам
+def calculate_parameters():
+    try:
+        laser_freq = float(laser_freq_var.get())
+        camera_freq = float(camera_freq_var.get())
+    except Exception as e:
+        print("Ошибка ввода частот:", e)
+        return
+
+    if laser_freq <= 0:
+        print("Частота лазера должна быть больше нуля.")
+        return
+
+    # Предполагаем, что для получения двух кадров на период лазера требуется:
+    # Trigger Count = 2
+    # Период лазера T = 1 / laser_freq (сек)
+    # Первый кадр: задержка = T/4, второй: с интервалом T/2 относительно первого
+    T = 1.0 / laser_freq  # период в секундах
+    computed_delay = int((T / 4) * 1e6)      # в микросекундах
+    computed_interval = int((T / 2) * 1e6)     # в микросекундах
+    computed_trigger_count = 2
+
+    trigger_count_var.set(str(computed_trigger_count))
+    trigger_delay_var.set(str(computed_delay))
+    trigger_interval_var.set(str(computed_interval))
+    print("Вычисленные параметры:")
+    print(f"Trigger Count = {computed_trigger_count}, Delay = {computed_delay} us, Interval = {computed_interval} us")
+    # Можно также проверить, соответствует ли частота камеры требуемой (ожидается f_camera = 2*laser_freq)
+    expected_camera_freq = 2 * laser_freq
+    print(f"Ожидаемая частота камеры: {expected_camera_freq} Гц (введено {camera_freq} Гц)")
 
 # Инициализация камеры и SDK
 def init_camera():
@@ -127,20 +154,18 @@ def init_camera():
     except Exception as e:
         print("Не удалось инициализировать камеру:", e)
         exit(1)
-    # Устанавливаем режим внешнего триггера
     ret = mvsdk.CameraSetTriggerMode(hCamera, 1)
     if ret != 0:
         print("Ошибка установки внешнего триггера:", ret)
         mvsdk.CameraUnInit(hCamera)
         exit(1)
-    # Запускаем захват изображений
     mvsdk.CameraPlay(hCamera)
 
-# Завершение работы: остановка захвата и освобождение камеры
+# Завершение работы
 def on_closing():
     global running, hCamera
     running = False
-    time.sleep(0.2)  # небольшая задержка, чтобы поток захвата завершился
+    time.sleep(0.2)
     mvsdk.CameraUnInit(hCamera)
     root.destroy()
 
@@ -151,22 +176,39 @@ init_camera()
 root = tk.Tk()
 root.title("Настройка триггера камеры")
 
-# Фрейм для элементов управления
+# Фрейм для параметров частот
+freq_frame = ttk.Frame(root, padding="10")
+freq_frame.pack(side=tk.TOP, fill=tk.X)
+
+ttk.Label(freq_frame, text="Laser Frequency (Hz):").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+laser_freq_var = tk.StringVar(value="20")
+laser_freq_entry = ttk.Entry(freq_frame, textvariable=laser_freq_var, width=10)
+laser_freq_entry.grid(row=0, column=1, padx=5, pady=5)
+
+ttk.Label(freq_frame, text="Camera Frequency (Hz):").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
+camera_freq_var = tk.StringVar(value="40")
+camera_freq_entry = ttk.Entry(freq_frame, textvariable=camera_freq_var, width=10)
+camera_freq_entry.grid(row=0, column=3, padx=5, pady=5)
+
+calc_button = ttk.Button(freq_frame, text="Рассчитать параметры", command=calculate_parameters)
+calc_button.grid(row=0, column=4, padx=5, pady=5)
+
+# Фрейм для ручного ввода параметров триггера
 control_frame = ttk.Frame(root, padding="10")
 control_frame.pack(side=tk.TOP, fill=tk.X)
 
 ttk.Label(control_frame, text="Trigger Count:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-trigger_count_var = tk.StringVar(value="1")
+trigger_count_var = tk.StringVar(value="2")
 trigger_count_entry = ttk.Entry(control_frame, textvariable=trigger_count_var, width=10)
 trigger_count_entry.grid(row=0, column=1, padx=5, pady=5)
 
 ttk.Label(control_frame, text="Delay (us):").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
-trigger_delay_var = tk.StringVar(value="0")
+trigger_delay_var = tk.StringVar(value="12500")
 trigger_delay_entry = ttk.Entry(control_frame, textvariable=trigger_delay_var, width=10)
 trigger_delay_entry.grid(row=0, column=3, padx=5, pady=5)
 
 ttk.Label(control_frame, text="Interval (us):").grid(row=0, column=4, padx=5, pady=5, sticky=tk.W)
-trigger_interval_var = tk.StringVar(value="50000")
+trigger_interval_var = tk.StringVar(value="25000")
 trigger_interval_entry = ttk.Entry(control_frame, textvariable=trigger_interval_var, width=10)
 trigger_interval_entry.grid(row=0, column=5, padx=5, pady=5)
 
@@ -177,13 +219,10 @@ apply_button.grid(row=0, column=6, padx=5, pady=5)
 video_label = ttk.Label(root)
 video_label.pack()
 
-# Запускаем поток захвата кадров
+# Запуск потока захвата кадров
 capture_thread = threading.Thread(target=capture_loop, daemon=True)
 capture_thread.start()
 
-# Запускаем цикл обновления изображения
 root.after(30, update_image)
-
-# Обработка закрытия окна
 root.protocol("WM_DELETE_WINDOW", on_closing)
 root.mainloop()

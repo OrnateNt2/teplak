@@ -1,33 +1,27 @@
 import sys
 import time
 import platform
-import re   # для простого парсинга
+import re
+import cv2    # только для cv2.putText и cv2.absdiff (опционально, можно заменить на mvsdk.CameraDrawText)
 import numpy as np
 import mvsdk
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QPushButton,
-    QVBoxLayout, QHBoxLayout, QGroupBox, QLineEdit
+    QVBoxLayout, QHBoxLayout, QGroupBox, QLineEdit, QCheckBox
 )
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap
 
-
-####################################
-# Вспомогательные функции
-####################################
-
+############################
+# Парсер для settings.Config
+############################
 def parse_config_file(file_path):
     """
-    Простейший парсер для settings.Config.
-    Ищет нужные ключи по регулярным выражениям.
-    Возвращает словарь с параметрами.
+    Простой парсер для извлечения строк "ключ = значение;"
+    Возвращает словарь {key: val}
     """
     params = {}
-    # Пример:
-    #  iIndex = 4;
-    #  iHOffsetFOV = 976;
-    #  exp_time = 14580.0;
     pattern = re.compile(r'(\w+)\s*=\s*"?([\w\.\-]+)"?\s*;')
 
     with open(file_path, 'r', encoding='utf-8') as f:
@@ -36,16 +30,17 @@ def parse_config_file(file_path):
     for match in pattern.finditer(text):
         key = match.group(1)
         val = match.group(2)
-        # Попробуем привести val к float или int
+        # Попытка конвертации
         if re.fullmatch(r'\d+', val):
             val = int(val)
         elif re.fullmatch(r'\d+\.\d+', val):
             val = float(val)
         params[key] = val
-
     return params
 
-
+############################
+# Конвертация numpy -> QPixmap
+############################
 def convert_frame_to_qpixmap(frame):
     """
     Numpy (BGR или GRAY) -> QImage -> QPixmap
@@ -63,17 +58,15 @@ def convert_frame_to_qpixmap(frame):
         qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
     return QPixmap.fromImage(qimg)
 
-
-####################################
-#   Основной класс PyQt
-####################################
-
+############################
+# Основной класс
+############################
 class CameraApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MvSDK + settings.Config Demo")
+        self.setWindowTitle("MvSDK + PyQt Demo (Video + Diff)")
 
-        # Камера
+        # Камера и буферы
         self.hCamera = None
         self.capability = None
         self.monoCamera = False
@@ -83,22 +76,25 @@ class CameraApp(QWidget):
         # Списки
         self.devList = mvsdk.CameraEnumerateDevice()
         self.resList = []
+        self.loadModes = [("ByModel", 0), ("ByName", 1), ("BySN", 2)]
 
-        # Подгрузим конфиг (если есть)
+        # config
+        self.config_file_path = "settings.Config"
         self.config_params = {}
-        self.config_file_path = "settings.Config"  # имя файла по умолчанию
-        # Попробуем считать
-        self.load_config_file()
+        self.load_config()
 
-        # LoadModes (ByModel=0, ByName=1, BySN=2)
-        self.loadModes = [("ByModel", 0),
-                          ("ByName", 1),
-                          ("BySN", 2)]
-
-        # Для подсчёта FPS
+        # Параметры FPS
         self.frame_count = 0
         self.prev_time = time.time()
         self.fps = 0.0
+
+        # Параметры фонарика
+        self.flash_freq = 10.0     # Гц, по умолчанию
+        self.flash_period = 1.0 / self.flash_freq
+        self.phase = 0.0
+
+        # Режим разности
+        self.prev_frame = None
 
         # Интерфейс
         self.initUI()
@@ -108,57 +104,74 @@ class CameraApp(QWidget):
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(5)
 
-    def load_config_file(self):
+    def load_config(self):
         """
-        Загружаем settings.Config (если он есть),
-        парсим ключи, например iHOffsetFOV=..., iIndex=..., exp_time=...
-        Результат храним в self.config_params.
+        Пытаемся прочитать settings.Config
         """
         try:
             self.config_params = parse_config_file(self.config_file_path)
             print("Config loaded:", self.config_params)
         except Exception as e:
-            print("Не удалось прочитать config:", e)
+            print("Не удалось загрузить config:", e)
             self.config_params = {}
 
     def initUI(self):
         """
-        Создаём элементы GUI:
-        - Выбор камеры
-        - Выбор loadMode (ByModel/ByName/BySN)
-        - Кнопка "Open"
-        - Кнопка "Apply config" (чтобы выставлять resolution / exposure из config)
-        - Выбор разрешений (через ComboBox)
-        - QLabel для видео + fps
+        Создание интерфейса:
+         - ComboBox для выбора камеры
+         - ComboBox для выбора loadMode
+         - Кнопка "Open"
+         - ComboBox для разрешения + кнопка "Set Res"
+         - Кнопка "Apply Config"
+         - QLineEdit для ввода частоты фонарика
+         - CheckBox для Diff Mode
+         - Label для исходного кадра
+         - Label для разности
+         - Label для FPS
         """
-        # --- Выбор камеры ---
+
+        # 1) Выбор камеры
         self.comboCamera = QComboBox()
         for i, dev in enumerate(self.devList):
-            text = f"{i}: {dev.GetFriendlyName()} (SN:{dev.GetSn()})"
-            self.comboCamera.addItem(text)
-        self.comboCamera.setCurrentIndex(0)
+            txt = f"{i}: {dev.GetFriendlyName()} (SN:{dev.GetSn()})"
+            self.comboCamera.addItem(txt)
 
-        # --- Выбор load mode ---
+        # 2) Выбор loadMode
         self.comboLoadMode = QComboBox()
         for (name, val) in self.loadModes:
             self.comboLoadMode.addItem(name, val)
-        # Если хотите по умолчанию BySN, ставьте setCurrentIndex(2)
 
-        # --- Кнопки ---
+        # 3) Кнопка Open
         self.btnOpen = QPushButton("Open Camera")
         self.btnOpen.clicked.connect(self.on_open_camera)
 
-        self.btnApplyConfig = QPushButton("Apply Config")
-        self.btnApplyConfig.clicked.connect(self.on_apply_config)
-
-        # --- Выбор разрешения ---
+        # 4) Выбор разрешения
         self.comboRes = QComboBox()
         self.btnSetRes = QPushButton("Set Resolution")
         self.btnSetRes.clicked.connect(self.on_set_resolution)
 
-        # --- Label для видео, FPS
-        self.labelView = QLabel("No camera")
-        self.labelView.setScaledContents(True)
+        # 5) ApplyConfig
+        self.btnApplyConf = QPushButton("Apply Config")
+        self.btnApplyConf.clicked.connect(self.on_apply_config)
+
+        # 6) Частота фонарика
+        self.editFreq = QLineEdit("10.0")
+        self.editFreq.setFixedWidth(60)
+        self.editFreq.editingFinished.connect(self.on_freq_changed)
+
+        # 7) CheckBox "Difference"
+        self.checkDiff = QCheckBox("Difference Mode")
+        self.checkDiff.setChecked(False)
+
+        # Основные лейблы (Original / Diff)
+        self.labelOrig = QLabel("No camera")
+        self.labelOrig.setScaledContents(True)
+
+        self.labelDiff = QLabel("Diff off")
+        self.labelDiff.setScaledContents(True)
+        self.labelDiff.setVisible(False)  # по умолчанию скрыт, если checkDiff не активен
+
+        # FPS
         self.labelFps = QLabel("FPS: 0.0")
 
         # Компоновка
@@ -170,28 +183,35 @@ class CameraApp(QWidget):
         row2 = QHBoxLayout()
         row2.addWidget(self.comboRes)
         row2.addWidget(self.btnSetRes)
-        row2.addWidget(self.btnApplyConfig)
+        row2.addWidget(self.btnApplyConf)
+        row2.addWidget(QLabel("Flash Freq:"))
+        row2.addWidget(self.editFreq)
+        row2.addWidget(self.checkDiff)
+
+        rowImages = QHBoxLayout()
+        rowImages.addWidget(self.labelOrig)
+        rowImages.addWidget(self.labelDiff)
 
         vlayout = QVBoxLayout()
         vlayout.addLayout(row1)
         vlayout.addLayout(row2)
-        vlayout.addWidget(self.labelView)
+        vlayout.addLayout(rowImages)
         vlayout.addWidget(self.labelFps)
 
         self.setLayout(vlayout)
-        self.setMinimumSize(800, 600)
+        self.setMinimumSize(1000, 600)
 
     def on_open_camera(self):
         """
-        Инициализация выбранной камеры по выбранному LoadMode
+        Инициализация камеры (заданной в comboCamera) с loadMode
         """
         idx = self.comboCamera.currentIndex()
         if idx < 0 or idx >= len(self.devList):
             return
         DevInfo = self.devList[idx]
-
         loadMode = self.comboLoadMode.currentData()  # 0,1,2
-        print("Open camera idx=", idx, "loadMode=", loadMode)
+
+        # Закроем, если была открыта
         self.close_camera()
 
         try:
@@ -210,10 +230,8 @@ class CameraApp(QWidget):
         else:
             mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
 
-        # Режим непрерывного захвата
+        # Непрерывная съемка, ручная экспозиция (30ms)
         #mvsdk.CameraSetTriggerMode(self.hCamera, 0)
-
-        # Выключаем автоэкспозицию, ставим 30ms (пример)
         mvsdk.CameraSetAeState(self.hCamera, 0)
         mvsdk.CameraSetExposureTime(self.hCamera, 30000)
 
@@ -227,7 +245,7 @@ class CameraApp(QWidget):
         self.FrameBufferSize = maxw * maxh * depth
         self.pFrameBuffer = mvsdk.CameraAlignMalloc(self.FrameBufferSize, 16)
 
-        # Заполняем comboRes
+        # Заполним comboRes
         self.comboRes.clear()
         self.resList.clear()
 
@@ -243,10 +261,11 @@ class CameraApp(QWidget):
             self.resList.append(r.clone())
 
         print("Camera opened OK.")
+        self.prev_frame = None
 
     def on_set_resolution(self):
         """
-        Применяем выбранный в comboRes вариант
+        Применяем выбранный из comboRes вариант (CameraSetImageResolution)
         """
         if not self.hCamera:
             return
@@ -256,16 +275,16 @@ class CameraApp(QWidget):
         newRes = self.resList[idxRes]
         err = mvsdk.CameraSetImageResolution(self.hCamera, newRes)
         if err == 0:
-            print(f"Set resolution: iIndex={newRes.iIndex}, {newRes.iWidthFOV}x{newRes.iHeightFOV}")
+            print(f"Set resolution => iIndex={newRes.iIndex}, ROI=({newRes.iWidthFOV}x{newRes.iHeightFOV})")
+            # Сброс prev_frame
+            self.prev_frame = None
         else:
             print("CameraSetImageResolution failed:", err)
-        # Иногда нужно перезапустить поток
-        # mvsdk.CameraPlay(self.hCamera)
 
     def on_apply_config(self):
         """
-        Применяем параметры из config (пример: ROI / экспозицию).
-        Допустим, у нас есть iIndex, iWidthFOV, iHeightFOV, iHOffsetFOV, iVOffsetFOV, exp_time
+        Применяем ROI, exp_time, analog_gain из settings.Config
+        (примерно как в предыдущем коде).
         """
         if not self.hCamera:
             return
@@ -273,26 +292,19 @@ class CameraApp(QWidget):
 
         iIndex = cfg.get("iIndex", None)
         if iIndex is not None:
-            # У нас есть все поля, чтобы вызвать CameraSetImageResolutionEx
-            # (чтобы точно задать ROI)
             iHOffsetFOV = cfg.get("iHOffsetFOV", 0)
             iVOffsetFOV = cfg.get("iVOffsetFOV", 0)
             iWidthFOV   = cfg.get("iWidthFOV", 640)
             iHeightFOV  = cfg.get("iHeightFOV", 480)
-            iWidth      = cfg.get("iWidth", iWidthFOV)
-            iHeight     = cfg.get("iHeight", iHeightFOV)
+            # iWidth / iHeight для выхода, часто совпадают
+            iWidth  = cfg.get("iWidth", iWidthFOV)
+            iHeight = cfg.get("iHeight", iHeightFOV)
 
-            # Пример вызова CameraSetImageResolutionEx
-            # Аргументы:
-            #  hCamera,
-            #  iIndex, Mode=0, ModeSize=0,
-            #  x, y, w, h,
-            #  ZoomW=0, ZoomH=0
             err = mvsdk.CameraSetImageResolutionEx(
                 self.hCamera,
-                iIndex,     # iIndex
-                0,          # Mode
-                0,          # ModeSize
+                iIndex,  # iIndex
+                0,       # Mode
+                0,       # ModeSize
                 iHOffsetFOV,
                 iVOffsetFOV,
                 iWidthFOV,
@@ -301,33 +313,37 @@ class CameraApp(QWidget):
                 0
             )
             if err == 0:
-                print(f"Apply config ROI: iIndex={iIndex}, ROI=({iHOffsetFOV},{iVOffsetFOV},{iWidthFOV}x{iHeightFOV})")
+                print(f"Apply config => iIndex={iIndex}, ROI=({iWidthFOV}x{iHeightFOV}), offset=({iHOffsetFOV},{iVOffsetFOV})")
+                self.prev_frame = None
             else:
                 print("CameraSetImageResolutionEx failed:", err)
 
-        # Экспозиция
         exp_time = cfg.get("exp_time", None)
         if exp_time is not None:
-            # Например, 14580 => ~14.58 ms
-            # SDK требует [микросекунды]
             err = mvsdk.CameraSetExposureTime(self.hCamera, exp_time)
             if err == 0:
-                print(f"Set exposureTime={exp_time} us")
+                print(f"Set ExposureTime={exp_time} us")
             else:
                 print("CameraSetExposureTime failed:", err)
 
-        # anal_gain
         analog_gain = cfg.get("analog_gain", None)
         if analog_gain is not None:
-            # Если SDK поддерживает SetAnalogGain / SetAnalogGainX
-            # analog_gain = 4 => ...
-            # Пример (в зависимости от вашей модели):
-            # mvsdk.CameraSetAnalogGainX(self.hCamera, float(analog_gain))
-            # или:
             mvsdk.CameraSetAnalogGain(self.hCamera, int(analog_gain))
-            print(f"Set analog gain={analog_gain}")
+            print(f"Set analog_gain={analog_gain}")
 
-        # При необходимости можно вызвать mvsdk.CameraPlay(self.hCamera) заново
+    def on_freq_changed(self):
+        """
+        Пользователь завершил ввод "Flash Freq"
+        """
+        txt = self.editFreq.text().strip()
+        try:
+            val = float(txt)
+            if val > 0:
+                self.flash_freq = val
+                self.flash_period = 1.0 / val
+                print(f"Flash frequency set to {val} Hz, T={self.flash_period}")
+        except ValueError:
+            print("Invalid freq input")
 
     def close_camera(self):
         if self.hCamera:
@@ -338,39 +354,115 @@ class CameraApp(QWidget):
             self.pFrameBuffer = None
 
     def update_frame(self):
+        """
+        Считываем кадр и показываем.
+        Если Difference Mode включён, формируем diff с prev_frame.
+        Рассчитываем FPS и фазу мерцания (flash_freq).
+        """
         if not self.hCamera:
             return
 
+        # FPS
         current_time = time.time()
         self.frame_count += 1
-        if current_time - self.prev_time >= 1.0:
+        if (current_time - self.prev_time) >= 1.0:
             self.fps = self.frame_count / (current_time - self.prev_time)
             self.frame_count = 0
             self.prev_time = current_time
-            self.labelFps.setText(f"FPS: {self.fps:.2f}")
+
+        # Фаза
+        if self.flash_period > 0:
+            self.phase = ((current_time) % self.flash_period) / self.flash_period
+        else:
+            self.phase = 0.0
 
         try:
+            # Захват
             pRawData, FrameHead = mvsdk.CameraGetImageBuffer(self.hCamera, 50)
             mvsdk.CameraImageProcess(self.hCamera, pRawData, self.pFrameBuffer, FrameHead)
             mvsdk.CameraReleaseImageBuffer(self.hCamera, pRawData)
 
+            # Windows => переворот
             if platform.system() == "Windows":
                 mvsdk.CameraFlipFrameBuffer(self.pFrameBuffer, FrameHead, 1)
 
+            # В numpy
             frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(self.pFrameBuffer)
             frame = np.frombuffer(frame_data, dtype=np.uint8)
 
             ch = 1 if (FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8) else 3
             frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, ch))
 
-            # Без resize, чтобы не «съедать» FPS
-            pix = convert_frame_to_qpixmap(frame)
-            self.labelView.setPixmap(pix)
+            # Пример: добавим текст (FPS, Phase, Freq) прямо на кадр. 
+            # Для этого используем cv2.putText (требует frame BGR/GRAY).
+            # Mono => у нас shape=(h,w,1). cv2.putText требует (h,w,3) BGR. 
+            # Упростим: если mono, конвертируем в BGR:
+            if ch == 1:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+
+            cv2.putText(frame, f"FPS: {self.fps:.2f}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(frame, f"Phase: {self.phase:.2f}", (10, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.putText(frame, f"FlashFreq: {self.flash_freq:.2f}", (10, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+            # Преобразуем обратно в нужный формат (если monoCamera), 
+            # но можно оставить 3-канальный BGR - для отображения QPixmap нормально
+            final_frame = frame
+
+            # Вывод
+            pix_orig = convert_frame_to_qpixmap(final_frame)
+            self.labelOrig.setPixmap(pix_orig)
+
+            # Режим разности
+            if self.checkDiff.isChecked():
+                self.labelDiff.setVisible(True)
+                if self.prev_frame is not None:
+                    # Считаем разницу
+                    # У нас prev_frame мог быть другого размера, 
+                    # но обычно нет - ROI не меняем на ходу
+                    # Убедимся, что prev_frame тоже 3-channel
+                    if len(self.prev_frame.shape) == 2:
+                        prev_bgr = cv2.cvtColor(self.prev_frame, cv2.COLOR_GRAY2BGR)
+                    elif self.prev_frame.shape[2] == 1:
+                        prev_bgr = cv2.cvtColor(self.prev_frame, cv2.COLOR_GRAY2BGR)
+                    else:
+                        prev_bgr = self.prev_frame
+
+                    diff = cv2.absdiff(frame, prev_bgr)
+                    cv2.putText(diff, f"FPS: {self.fps:.2f}", (10, 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(diff, f"Phase: {self.phase:.2f}", (10, 70),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                    cv2.putText(diff, f"FlashFreq: {self.flash_freq:.2f}", (10, 110),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+                    pix_diff = convert_frame_to_qpixmap(diff)
+                    self.labelDiff.setPixmap(pix_diff)
+                else:
+                    self.labelDiff.setText("No prev_frame yet")
+            else:
+                self.labelDiff.setVisible(False)
+
+            # Сохраняем текущий кадр как prev_frame (у нас BGR 3-канальный)
+            self.prev_frame = frame.copy()  # BGR
+
+            # FPS label
+            self.labelFps.setText(f"FPS: {self.fps:.2f}")
 
         except mvsdk.CameraException as e:
             # -12 = CAMERA_STATUS_TIME_OUT
             if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
                 print("CameraGetImageBuffer failed:", e)
+
+    def close_camera(self):
+        if self.hCamera:
+            mvsdk.CameraUnInit(self.hCamera)
+            self.hCamera = None
+        if self.pFrameBuffer:
+            mvsdk.CameraAlignFree(self.pFrameBuffer)
+            self.pFrameBuffer = None
 
     def closeEvent(self, event):
         self.close_camera()

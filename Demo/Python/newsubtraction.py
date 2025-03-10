@@ -1,157 +1,275 @@
-#coding=utf-8
-import cv2
+import sys
+import time
+import platform
 import numpy as np
 import mvsdk
-import platform
-import time
 
-def main_loop():
-    # Перечисляем камеры
-    DevList = mvsdk.CameraEnumerateDevice()
-    nDev = len(DevList)
-    if nDev < 1:
-        print("Не найдена ни одна камера!")
-        return
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QComboBox, QPushButton,
+    QVBoxLayout, QHBoxLayout, QGroupBox, QRadioButton, QButtonGroup
+)
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QImage, QPixmap
 
-    # Выводим список найденных камер
-    for i, DevInfo in enumerate(DevList):
-        print("{}: {}  SN:{}".format(i, DevInfo.GetFriendlyName(), DevInfo.GetSn()))
-    # Выбираем камеру
-    i = 0 if nDev == 1 else int(input("Выберите камеру (по индексу): "))
-    DevInfo = DevList[i]
-
-    print("Выбранная камера:")
-    print("  FriendlyName:", DevInfo.GetFriendlyName())
-    print("  PortType:", DevInfo.GetPortType())
-    print("  SN:", DevInfo.GetSn())
-
-    # Попытка инициализировать BySN
-    # Обычно: emParamLoadMode = 2 => BySN (проверьте вашу документацию!)
-    emParamLoadMode = 2  # BySN
-    try:
-        hCamera = mvsdk.CameraInit(DevInfo, emParamLoadMode, -1)
-    except mvsdk.CameraException as e:
-        print("CameraInit Failed({}): {}".format(e.error_code, e.message))
-        return
-
-    # Получаем характеристики камеры
-    cap = mvsdk.CameraGetCapability(hCamera)
-    monoCamera = (cap.sIspCapacity.bMonoSensor != 0)
-
-    # Настраиваем формат (черно-белый или BGR)
-    if monoCamera:
-        mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
+def convert_frame_to_qpixmap(frame):
+    """
+    Numpy (BGR или GRAY) -> QImage -> QPixmap
+    """
+    if len(frame.shape) == 2 or frame.shape[2] == 1:
+        # GRAY
+        h, w = frame.shape[:2]
+        bytes_per_line = w
+        qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
     else:
-        mvsdk.CameraSetIspOutFormat(hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
+        # BGR -> RGB
+        h, w, ch = frame.shape
+        rgb = frame[..., ::-1]
+        bytes_per_line = ch * w
+        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+    return QPixmap.fromImage(qimg)
 
-    # Убираем триггерный режим, ставим непрерывную съемку
-    # (если SDK требует явно что-то выключить, убираем CameraSetTriggerMode)
-    #mvsdk.CameraSetTriggerMode(hCamera, 0)  # Если нужно, используйте 0 = continuous
+class CameraApp(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("MvSDK Demo: Video Output & FPS (PyQt)")
 
-    # Выключаем автоэкспозицию, ставим вручную 30 мс (пример)
-    mvsdk.CameraSetAeState(hCamera, 0)
-    mvsdk.CameraSetExposureTime(hCamera, 30_000)  # 30 ms
+        # Камера
+        self.hCamera = None
+        self.monoCamera = False
+        self.capability = None
+        self.pFrameBuffer = None
+        self.FrameBufferSize = 0
 
-    # Запускаем камеру
-    mvsdk.CameraPlay(hCamera)
+        # Списки для выбора
+        self.devList = mvsdk.CameraEnumerateDevice()    # камеры
+        self.resList = []                               # разрешения
+        self.loadModes = [("ByModel", 0),
+                          ("ByName", 1),
+                          ("BySN", 2)]
 
-    # Расчет максимального буфера
-    FrameBufferSize = (cap.sResolutionRange.iWidthMax *
-                       cap.sResolutionRange.iHeightMax *
-                       (1 if monoCamera else 3))
-    pFrameBuffer = mvsdk.CameraAlignMalloc(FrameBufferSize, 16)
+        # Переменные для расчёта FPS
+        self.frame_count = 0
+        self.prev_time = time.time()
+        self.fps = 0.0
 
-    # Спросим у пользователя частоту фонаря
-    try:
-        flash_freq = float(input("Введите частоту мерцания фонаря (Hz): "))
-    except ValueError:
-        flash_freq = 1.0
+        # Интерфейс
+        self.initUI()
 
-    flash_period = 1.0 / flash_freq if flash_freq > 0 else 0
+        # Таймер для обновления
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_frame)
+        # По умолчанию ставим 5 мс, чтобы максимально часто считывать кадры
+        self.timer.start(5)
 
-    # Переменные для измерения FPS
-    prev_time = time.time()
-    frame_count = 0
-    fps = 0.0
+    def initUI(self):
+        """
+        Создаём элементы управления:
+        - Выбор камеры
+        - Выбор load mode (ByModel, ByName, BySN)
+        - Кнопка "Open camera"
+        - Выбор разрешения
+        - Кнопка "Set resolution"
+        - QLabel для вывода изображения
+        - QLabel для вывода FPS
+        """
 
-    prev_frame = None
+        # --- Выбор камеры ---
+        self.comboCamera = QComboBox()
+        for i, dev in enumerate(self.devList):
+            text = f"{i}: {dev.GetFriendlyName()} (SN:{dev.GetSn()})"
+            self.comboCamera.addItem(text)
+        # Если нет камер, comboCamera будет пустым
 
-    while True:
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        # --- Выбор Load Mode (ByModel, ByName, BySN) ---
+        self.comboLoadMode = QComboBox()
+        for (name, val) in self.loadModes:
+            self.comboLoadMode.addItem(name, val)
+        self.comboLoadMode.setCurrentIndex(2)  # По умолчанию BySN (если хотим)
 
-        current_time = time.time()
-        frame_count += 1
-        elapsed = current_time - prev_time
-        if elapsed >= 1.0:
-            fps = frame_count / elapsed
-            frame_count = 0
-            prev_time = current_time
+        # --- Кнопка "Open camera" ---
+        self.btnOpen = QPushButton("Open Camera")
+        self.btnOpen.clicked.connect(self.on_open_camera)
 
-        # Фаза мерцания фонарика (в диапазоне [0..1])
-        phase = (current_time % flash_period) / flash_period if flash_period > 0 else 0.0
+        # --- Выбор разрешения ---
+        self.comboRes = QComboBox()  
+        self.btnSetRes = QPushButton("Set Resolution")
+        self.btnSetRes.clicked.connect(self.on_set_resolution)
 
-        # Пытаемся получить кадр
+        # --- Метки для изображения и FPS ---
+        self.labelView = QLabel("No camera")
+        self.labelView.setScaledContents(True)
+        self.labelFps = QLabel("FPS: 0.0")
+
+        # Компоновка
+        row1 = QHBoxLayout()
+        row1.addWidget(self.comboCamera)
+        row1.addWidget(self.comboLoadMode)
+        row1.addWidget(self.btnOpen)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(self.comboRes)
+        row2.addWidget(self.btnSetRes)
+
+        vlayout = QVBoxLayout()
+        vlayout.addLayout(row1)
+        vlayout.addLayout(row2)
+        vlayout.addWidget(self.labelView)
+        vlayout.addWidget(self.labelFps)
+
+        self.setLayout(vlayout)
+        self.setMinimumSize(800, 600)
+
+    def on_open_camera(self):
+        """
+        Инициализация камеры по выбранному LoadMode + DevInfo
+        """
+        idx = self.comboCamera.currentIndex()
+        if idx < 0 or idx >= len(self.devList):
+            return
+        DevInfo = self.devList[idx]
+
+        loadMode = self.comboLoadMode.currentData()  # 0,1,2
+        print(f"Opening camera idx={idx}, loadMode={loadMode}")
+
+        # Если уже открыта — закрываем
+        self.close_camera()
+
+        # Инициализация
         try:
-            pRawData, FrameHead = mvsdk.CameraGetImageBuffer(hCamera, 200)
-            # Обработка RAW → pFrameBuffer (BGR8 / MONO8)
-            mvsdk.CameraImageProcess(hCamera, pRawData, pFrameBuffer, FrameHead)
-            # Освобождаем
-            mvsdk.CameraReleaseImageBuffer(hCamera, pRawData)
+            self.hCamera = mvsdk.CameraInit(DevInfo, loadMode, -1)
+        except mvsdk.CameraException as e:
+            print("CameraInit Failed:", e)
+            self.hCamera = None
+            return
 
-            # Windows: переворачиваем буфер
+        # Получаем capability
+        self.capability = mvsdk.CameraGetCapability(self.hCamera)
+        self.monoCamera = (self.capability.sIspCapacity.bMonoSensor != 0)
+
+        # Формат вывода
+        if self.monoCamera:
+            mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
+        else:
+            mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
+
+        # Непрерывная съемка (если нужно, можно вызвать CameraSetTriggerMode(hCamera, 0))
+        # Выключим автоэкспозицию, выставим ~30 мс (пример)
+        mvsdk.CameraSetAeState(self.hCamera, 0)
+        mvsdk.CameraSetExposureTime(self.hCamera, 30000)
+
+        # Запуск
+        mvsdk.CameraPlay(self.hCamera)
+
+        # Выделяем буфер
+        maxw = self.capability.sResolutionRange.iWidthMax
+        maxh = self.capability.sResolutionRange.iHeightMax
+        depth = 1 if self.monoCamera else 3
+        self.FrameBufferSize = maxw * maxh * depth
+        self.pFrameBuffer = mvsdk.CameraAlignMalloc(self.FrameBufferSize, 16)
+
+        # Заполним comboRes (список предустановленных разрешений)
+        self.comboRes.clear()
+        self.resList.clear()
+
+        count = self.capability.iImageSizeDesc
+        pResDesc = self.capability.pImageSizeDesc
+        for i in range(count):
+            r = pResDesc[i]
+            desc = r.GetDescription()
+            w = r.iWidthFOV
+            h = r.iHeightFOV
+            text = f"{desc} ({w}x{h})"
+            self.comboRes.addItem(text)
+            self.resList.append(r.clone())
+
+        print("Camera opened successfully.")
+
+    def on_set_resolution(self):
+        """
+        Применяем выбранное (из comboRes) разрешение
+        """
+        if self.hCamera is None:
+            return
+        idxRes = self.comboRes.currentIndex()
+        if idxRes < 0 or idxRes >= len(self.resList):
+            return
+
+        newRes = self.resList[idxRes]
+        err = mvsdk.CameraSetImageResolution(self.hCamera, newRes)
+        if err != 0:
+            print("CameraSetImageResolution failed:", err)
+        else:
+            print(f"Set resolution: {newRes.iWidthFOV}x{newRes.iHeightFOV}")
+
+    def close_camera(self):
+        """
+        Закрыть камеру (если открыта).
+        """
+        if self.hCamera:
+            mvsdk.CameraUnInit(self.hCamera)
+            self.hCamera = None
+        if self.pFrameBuffer:
+            mvsdk.CameraAlignFree(self.pFrameBuffer)
+            self.pFrameBuffer = None
+
+    def update_frame(self):
+        """
+        Считываем кадр, отображаем, считаем FPS
+        """
+        if not self.hCamera:
+            return
+
+        # Считаем FPS
+        current_time = time.time()
+        self.frame_count += 1
+        if (current_time - self.prev_time) >= 1.0:
+            self.fps = self.frame_count / (current_time - self.prev_time)
+            self.frame_count = 0
+            self.prev_time = current_time
+            # Обновим labelFps
+            self.labelFps.setText(f"FPS: {self.fps:.2f}")
+
+        # Пробуем получить кадр
+        try:
+            pRawData, FrameHead = mvsdk.CameraGetImageBuffer(self.hCamera, 50)
+            # Обрабатываем RAW -> pFrameBuffer
+            mvsdk.CameraImageProcess(self.hCamera, pRawData, self.pFrameBuffer, FrameHead)
+            mvsdk.CameraReleaseImageBuffer(self.hCamera, pRawData)
+
+            # Windows => переворот
             if platform.system() == "Windows":
-                mvsdk.CameraFlipFrameBuffer(pFrameBuffer, FrameHead, 1)
+                mvsdk.CameraFlipFrameBuffer(self.pFrameBuffer, FrameHead, 1)
 
             # Преобразуем в numpy
-            frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(pFrameBuffer)
+            frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(self.pFrameBuffer)
             frame = np.frombuffer(frame_data, dtype=np.uint8)
+
             ch = 1 if (FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8) else 3
             frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, ch))
 
-            # Можно изменить размер, если хотим фиксированный (например, 640x480)
-            frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
+            # (Опционально) Не делаем resize, чтобы не «съедать» FPS
+            # Если окно слишком большое, PyQt может тормозить
+            #frame = cv2.resize(frame, (640, 480), interpolation=cv2.INTER_LINEAR)
 
-            # Считаем разницу с предыдущим кадром (по желанию)
-            if prev_frame is not None:
-                diff = cv2.absdiff(frame, prev_frame)
-
-                # Выводим текст
-                cv2.putText(diff, f"FPS: {fps:.2f}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(diff, f"Phase: {phase:.2f}", (10, 70),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(diff, f"Flash Freq: {flash_freq:.2f} Hz", (10, 110),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-                cv2.imshow("Разница", diff)
-
-            # На оригинальном кадре тоже можно вывести
-            cv2.putText(frame, f"FPS: {fps:.2f}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, f"Phase: {phase:.2f}", (10, 70),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(frame, f"Flash Freq: {flash_freq:.2f} Hz", (10, 110),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
-            cv2.imshow("Оригинал", frame)
-            prev_frame = frame.copy()
+            # Показ в labelView
+            pix = convert_frame_to_qpixmap(frame)
+            self.labelView.setPixmap(pix)
 
         except mvsdk.CameraException as e:
-            # CAMERA_STATUS_TIME_OUT = -12 (превышено время ожидания кадра)
+            # -12 = CAMERA_STATUS_TIME_OUT
             if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
-                print("CameraGetImageBuffer failed({}): {}".format(e.error_code, e.message))
-                break
+                print("CameraGetImageBuffer failed:", e)
+                # Можно убрать break, чтобы продолжить в цикле
 
-    # Освобождаем ресурсы
-    mvsdk.CameraUnInit(hCamera)
-    mvsdk.CameraAlignFree(pFrameBuffer)
+    def closeEvent(self, event):
+        self.close_camera()
+        event.accept()
 
 def main():
-    try:
-        main_loop()
-    finally:
-        cv2.destroyAllWindows()
+    app = QApplication(sys.argv)
+    w = CameraApp()
+    w.show()
+    sys.exit(app.exec_())
 
 if __name__ == "__main__":
     main()

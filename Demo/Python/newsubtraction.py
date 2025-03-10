@@ -45,18 +45,28 @@ def convert_frame_to_qpixmap(frame):
     """
     Numpy (BGR или GRAY) -> QImage -> QPixmap
     """
+    h, w = frame.shape[:2]
+
+    # Проверяем, монохром или цвет
     if len(frame.shape) == 2 or frame.shape[2] == 1:
         # GRAY
-        h, w = frame.shape[:2]
+        # frame.shape = (h, w) или (h, w, 1)
+        # Нужно bytes_per_line = w
         bytes_per_line = w
-        qimg = QImage(frame.data, w, h, bytes_per_line, QImage.Format_Grayscale8)
+        gray_data = frame.tobytes()
+        qimg = QImage(gray_data, w, h, bytes_per_line, QImage.Format_Grayscale8)
     else:
-        # BGR -> RGB
-        h, w, ch = frame.shape
-        rgb = frame[..., ::-1]
+        # Цвет (BGR или RGB)
+        # frame.shape = (h, w, 3)
+        # Допустим, frame - BGR, делаем BGR->RGB
+        rgb = frame[..., ::-1]  
+        ch = 3
         bytes_per_line = ch * w
-        qimg = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        rgb_data = rgb.tobytes()
+        qimg = QImage(rgb_data, w, h, bytes_per_line, QImage.Format_RGB888)
+
     return QPixmap.fromImage(qimg)
+
 
 ############################
 # Основной класс

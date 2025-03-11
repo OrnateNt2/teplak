@@ -205,6 +205,7 @@ class CameraApp(QWidget):
 
         mvsdk.CameraSetAeState(self.hCamera, 0)
         mvsdk.CameraSetExposureTime(self.hCamera, 30000)
+        #Поменять на 10мс или 5мс, вместо 30мс
 
         # Play
         mvsdk.CameraPlay(self.hCamera)

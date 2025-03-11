@@ -45,7 +45,7 @@ def convert_frame_to_qpixmap(frame):
 class CameraApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MvSDK + PyQt (Resolution, Config, Diff, Trigger)")
+        self.setWindowTitle("MvSDK + PyQt (Resolution, Config, Diff, Trigger, Recording with Time)")
 
         # --- Камера/буфер/параметры ---
         self.hCamera = None
@@ -54,6 +54,7 @@ class CameraApp(QWidget):
         self.pFrameBuffer = None
         self.FrameBufferSize = 0
 
+        # Списки устройств
         self.devList = mvsdk.CameraEnumerateDevice()
         self.resList = []
         self.loadModes = [("ByModel", 0), ("ByName", 1), ("BySN", 2)]
@@ -76,17 +77,21 @@ class CameraApp(QWidget):
         # --- Для Difference Mode ---
         self.prev_frame = None
 
+        # --- Для записи видео ---
+        self.is_recording = False
+        self.writer_orig = None
+        self.writer_diff = None
+        self.video_fps = 30.0  # FPS для записи
+        self.video_size = None # (width, height), зададим автоматически
+
         self.initUI()
 
         # Таймер для покадрового чтения
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
-        self.timer.start(5)  # можно уменьшить до 1
+        self.timer.start(5)
 
     def load_config(self):
-        """
-        Парсинг settings.Config
-        """
         try:
             self.config_params = parse_config_file(self.config_file_path)
             print("Config loaded:", self.config_params)
@@ -133,17 +138,21 @@ class CameraApp(QWidget):
         self.checkHardwareTrigger.setChecked(False)
         self.checkHardwareTrigger.stateChanged.connect(self.on_trigger_mode_changed)
 
+        # === Кнопка Record (Start/Stop) ===
+        self.btnRecord = QPushButton("Start Recording")
+        self.btnRecord.clicked.connect(self.on_record_clicked)
+
         # === Лейблы для вывода (Original / Diff / FPS) ===
         self.labelOrig = QLabel("No camera")
         self.labelOrig.setScaledContents(True)
 
         self.labelDiff = QLabel("Diff off")
         self.labelDiff.setScaledContents(True)
-        self.labelDiff.setVisible(False)  # скрыт, если DiffMode off
+        self.labelDiff.setVisible(False)
 
         self.labelFps = QLabel("FPS: 0.0")
 
-        # --- Компоновка ---
+        # Layout
         row1 = QHBoxLayout()
         row1.addWidget(self.comboCamera)
         row1.addWidget(self.comboLoadMode)
@@ -157,6 +166,7 @@ class CameraApp(QWidget):
         row2.addWidget(self.editFreq)
         row2.addWidget(self.checkDiff)
         row2.addWidget(self.checkHardwareTrigger)
+        row2.addWidget(self.btnRecord)
 
         rowImages = QHBoxLayout()
         rowImages.addWidget(self.labelOrig)
@@ -172,9 +182,6 @@ class CameraApp(QWidget):
         self.setMinimumSize(1000, 600)
 
     def on_open_camera(self):
-        """
-        Открытие камеры по выбранному DevInfo и LoadMode
-        """
         idx = self.comboCamera.currentIndex()
         if idx < 0 or idx >= len(self.devList):
             return
@@ -198,14 +205,10 @@ class CameraApp(QWidget):
         else:
             mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
 
-        # Непрерывный режим
         mvsdk.CameraSetTriggerMode(self.hCamera, 0)
-
         mvsdk.CameraSetAeState(self.hCamera, 0)
         mvsdk.CameraSetExposureTime(self.hCamera, 30000)
-        # ПОМЕНЯТЬ 10000 = 10мс
 
-        # Запуск потока
         mvsdk.CameraPlay(self.hCamera)
 
         maxw = self.capability.sResolutionRange.iWidthMax
@@ -214,7 +217,6 @@ class CameraApp(QWidget):
         self.FrameBufferSize = maxw * maxh * ch
         self.pFrameBuffer = mvsdk.CameraAlignMalloc(self.FrameBufferSize, 16)
 
-        # Заполняем ComboRes
         self.comboRes.clear()
         self.resList.clear()
         count = self.capability.iImageSizeDesc
@@ -247,9 +249,6 @@ class CameraApp(QWidget):
             print("CameraSetImageResolution failed:", err)
 
     def on_apply_config(self):
-        """
-        Применяем ROI/экспозицию/гейн из settings.Config
-        """
         if not self.hCamera:
             return
         cfg = self.config_params
@@ -294,9 +293,6 @@ class CameraApp(QWidget):
             print("Invalid freq input")
 
     def on_trigger_mode_changed(self, state):
-        """
-        Включаем/выключаем аппаратный триггер: 2 => HW, 0 => Continuous
-        """
         if not self.hCamera:
             return
         if state == Qt.Checked:
@@ -312,6 +308,43 @@ class CameraApp(QWidget):
             else:
                 print("CameraSetTriggerMode(0) failed:", err)
 
+    def on_record_clicked(self):
+        if not self.is_recording:
+            # Начать запись
+            self.start_recording()
+            self.btnRecord.setText("Stop Recording")
+        else:
+            # Остановить запись
+            self.stop_recording()
+            self.btnRecord.setText("Start Recording")
+
+    def start_recording(self):
+        self.is_recording = True
+        # Генерируем время
+        # Пример: orig_20250315_184012.avi
+        time_str = time.strftime("%Y%m%d_%H%M%S")
+
+        filename_orig = f"orig_{time_str}.avi"
+        filename_diff = f"diff_{time_str}.avi"
+
+        print(f"Start recording to {filename_orig} and {filename_diff}")
+
+        self.video_size = None  # сбрасываем, заново подхватим при первом кадре
+
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        self.writer_orig = cv2.VideoWriter(filename_orig, fourcc, self.video_fps, (640,480))
+        self.writer_diff = cv2.VideoWriter(filename_diff, fourcc, self.video_fps, (640,480))
+
+    def stop_recording(self):
+        self.is_recording = False
+        if self.writer_orig:
+            self.writer_orig.release()
+            self.writer_orig = None
+        if self.writer_diff:
+            self.writer_diff.release()
+            self.writer_diff = None
+        print("Recording stopped.")
+
     def update_frame(self):
         if not self.hCamera:
             return
@@ -323,7 +356,6 @@ class CameraApp(QWidget):
             self.frame_count = 0
             self.prev_time = current_time
 
-        # Фаза фонарика
         if self.flash_period > 0:
             self.phase = (current_time % self.flash_period) / self.flash_period
         else:
@@ -342,6 +374,27 @@ class CameraApp(QWidget):
             ch = 1 if (FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8) else 3
             frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, ch))
 
+            # Определяем video_size
+            if self.video_size is None:
+                h, w = frame.shape[:2]
+                self.video_size = (w, h)
+                # Переоткроем writer, чтобы писать в реальном размере
+                if self.is_recording and self.writer_orig and self.writer_diff:
+                    self.writer_orig.release()
+                    self.writer_diff.release()
+                    fourcc = cv2.VideoWriter_fourcc(*'XVID')
+                    # Заново открываем с корректными размерами
+                    time_str = time.strftime("%Y%m%d_%H%M%S")
+                    filename_orig = f"orig_{time_str}.avi"
+                    filename_diff = f"diff_{time_str}.avi"
+                    print("Adjusting video size to:", self.video_size)
+                    self.writer_orig = cv2.VideoWriter(
+                        filename_orig, fourcc, self.video_fps, self.video_size
+                    )
+                    self.writer_diff = cv2.VideoWriter(
+                        filename_diff, fourcc, self.video_fps, self.video_size
+                    )
+
             if ch == 1:
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
             else:
@@ -357,16 +410,11 @@ class CameraApp(QWidget):
             pix_orig = convert_frame_to_qpixmap(frame_bgr)
             self.labelOrig.setPixmap(pix_orig)
 
-            # Difference Mode
+            diff_bgr = None
             if self.checkDiff.isChecked():
                 self.labelDiff.setVisible(True)
                 if self.prev_frame is not None:
-                    if len(self.prev_frame.shape) == 2 or self.prev_frame.shape[2] == 1:
-                        prev_bgr = cv2.cvtColor(self.prev_frame, cv2.COLOR_GRAY2BGR)
-                    else:
-                        prev_bgr = self.prev_frame
-                    diff = cv2.absdiff(frame_bgr, prev_bgr)
-
+                    diff = cv2.absdiff(frame_bgr, self.prev_frame)
                     cv2.putText(diff, f"FPS: {self.fps:.2f}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
                     cv2.putText(diff, f"Phase: {self.phase:.2f}", (10, 70),
@@ -376,19 +424,18 @@ class CameraApp(QWidget):
 
                     pix_diff = convert_frame_to_qpixmap(diff)
                     self.labelDiff.setPixmap(pix_diff)
+                    diff_bgr = diff
                 else:
                     self.labelDiff.setText("No prev_frame yet")
+                    diff_bgr = np.zeros_like(frame_bgr)
             else:
                 self.labelDiff.setVisible(False)
+                diff_bgr = np.zeros_like(frame_bgr)
 
             self.prev_frame = frame_bgr.copy()
-
             self.labelFps.setText(f"FPS: {self.fps:.2f}")
 
-            # -------------------------
-            #   ВЫВОД СТАТИСТИКИ КАДРОВ
-            # -------------------------
-            # tSdkFrameStatistic: iTotal, iCapture, iLost
+            # Вывод статистики кадров
             stat = mvsdk.tSdkFrameStatistic()
             err_stat = mvsdk.CameraGetFrameStatistic(self.hCamera, stat)
             if err_stat == 0:
@@ -396,11 +443,23 @@ class CameraApp(QWidget):
             else:
                 print("CameraGetFrameStatistic failed:", err_stat)
 
+            # Запись видео, если включено
+            if self.is_recording and self.writer_orig and self.writer_diff and self.video_size:
+                # Убедимся, что (frame_bgr.shape[1], frame_bgr.shape[0]) == video_size
+                if (frame_bgr.shape[1], frame_bgr.shape[0]) != self.video_size:
+                    frame_bgr = cv2.resize(frame_bgr, self.video_size)
+                if (diff_bgr.shape[1], diff_bgr.shape[0]) != self.video_size:
+                    diff_bgr = cv2.resize(diff_bgr, self.video_size)
+
+                self.writer_orig.write(frame_bgr)
+                self.writer_diff.write(diff_bgr)
+
         except mvsdk.CameraException as e:
             if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
                 print("CameraGetImageBuffer failed:", e)
 
     def close_camera(self):
+        self.stop_recording()
         if self.hCamera:
             mvsdk.CameraUnInit(self.hCamera)
             self.hCamera = None

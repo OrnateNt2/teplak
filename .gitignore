@@ -1,2 +1,13 @@
-__pycache__
-*
+/*
+!.gitignore
+
+!/Demo/
+
+/Demo/*
+
+!/Demo/Python/
+!/Demo/Python/**
+
+/Demo/Python/python_demo.zip
+
+/Demo/Python/**/__pycache__/

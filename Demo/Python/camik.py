@@ -197,7 +197,7 @@ class CameraApp(QWidget):
         self.is_recording = False
         self.writer_orig = None
         self.writer_diff = None
-        self.video_fps = 30.0  # FPS для записи
+        self.video_fps = 60.0  # FPS для записи
         self.video_size = None  # (width, height) — определяется при первом кадре
 
         self.worker = None  # Поток для захвата кадров

@@ -8,7 +8,7 @@ import mvsdk
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QPushButton,
-    QVBoxLayout, QHBoxLayout, QLineEdit, QCheckBox
+    QVBoxLayout, QHBoxLayout, QLineEdit, QCheckBox, QSlider
 )
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QImage, QPixmap
@@ -142,6 +142,15 @@ class CameraApp(QWidget):
         self.btnRecord = QPushButton("Start Recording")
         self.btnRecord.clicked.connect(self.on_record_clicked)
 
+        # === Регулировка экспозиции через слайдер ===
+        self.labelExposure = QLabel("Exposure: 30000 us")
+        self.sliderExposure = QSlider(Qt.Horizontal)
+        self.sliderExposure.setMinimum(100)
+        self.sliderExposure.setMaximum(100000)
+        self.sliderExposure.setValue(30000)
+        self.sliderExposure.setTickInterval(10000)
+        self.sliderExposure.valueChanged.connect(self.on_exposure_slider_changed)
+
         # === Лейблы для вывода (Original / Diff / FPS) ===
         self.labelOrig = QLabel("No camera")
         self.labelOrig.setScaledContents(True)
@@ -168,6 +177,10 @@ class CameraApp(QWidget):
         row2.addWidget(self.checkHardwareTrigger)
         row2.addWidget(self.btnRecord)
 
+        rowExposure = QHBoxLayout()
+        rowExposure.addWidget(self.labelExposure)
+        rowExposure.addWidget(self.sliderExposure)
+
         rowImages = QHBoxLayout()
         rowImages.addWidget(self.labelOrig)
         rowImages.addWidget(self.labelDiff)
@@ -175,11 +188,21 @@ class CameraApp(QWidget):
         layout = QVBoxLayout()
         layout.addLayout(row1)
         layout.addLayout(row2)
+        layout.addLayout(rowExposure)
         layout.addLayout(rowImages)
         layout.addWidget(self.labelFps)
 
         self.setLayout(layout)
         self.setMinimumSize(1000, 600)
+
+    def on_exposure_slider_changed(self, value):
+        self.labelExposure.setText(f"Exposure: {value} us")
+        if self.hCamera:
+            err = mvsdk.CameraSetExposureTime(self.hCamera, value)
+            if err == 0:
+                print(f"Exposure set to {value} us")
+            else:
+                print("Failed to set exposure, error code:", err)
 
     def on_open_camera(self):
         idx = self.comboCamera.currentIndex()
@@ -207,7 +230,7 @@ class CameraApp(QWidget):
 
         mvsdk.CameraSetTriggerMode(self.hCamera, 0)
         mvsdk.CameraSetAeState(self.hCamera, 0)
-        mvsdk.CameraSetExposureTime(self.hCamera, 30000)
+        mvsdk.CameraSetExposureTime(self.hCamera, self.sliderExposure.value())
 
         mvsdk.CameraPlay(self.hCamera)
 
@@ -321,7 +344,6 @@ class CameraApp(QWidget):
     def start_recording(self):
         self.is_recording = True
         # Генерируем время
-        # Пример: orig_20250315_184012.avi
         time_str = time.strftime("%Y%m%d_%H%M%S")
 
         filename_orig = f"orig_{time_str}.avi"
@@ -383,7 +405,6 @@ class CameraApp(QWidget):
                     self.writer_orig.release()
                     self.writer_diff.release()
                     fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                    # Заново открываем с корректными размерами
                     time_str = time.strftime("%Y%m%d_%H%M%S")
                     filename_orig = f"orig_{time_str}.avi"
                     filename_diff = f"diff_{time_str}.avi"
@@ -445,7 +466,6 @@ class CameraApp(QWidget):
 
             # Запись видео, если включено
             if self.is_recording and self.writer_orig and self.writer_diff and self.video_size:
-                # Убедимся, что (frame_bgr.shape[1], frame_bgr.shape[0]) == video_size
                 if (frame_bgr.shape[1], frame_bgr.shape[0]) != self.video_size:
                     frame_bgr = cv2.resize(frame_bgr, self.video_size)
                 if (diff_bgr.shape[1], diff_bgr.shape[0]) != self.video_size:

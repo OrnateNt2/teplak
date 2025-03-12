@@ -203,7 +203,6 @@ class CameraApp(QWidget):
         self.worker = None  # Поток для захвата кадров
 
         self.initUI()
-        # QTimer больше не используется
 
     def load_config(self):
         try:
@@ -264,6 +263,15 @@ class CameraApp(QWidget):
         self.sliderExposure.setValue(30000)
         self.sliderExposure.setTickInterval(10000)
         self.sliderExposure.valueChanged.connect(self.on_exposure_slider_changed)
+        
+        # === Регулировка усиления (analog gain) через слайдер ===
+        self.labelGain = QLabel("Gain: 1")
+        self.sliderGain = QSlider(Qt.Horizontal)
+        self.sliderGain.setMinimum(1)
+        self.sliderGain.setMaximum(16)
+        self.sliderGain.setValue(1)
+        self.sliderGain.setTickInterval(1)
+        self.sliderGain.valueChanged.connect(self.on_gain_slider_changed)
 
         # === Лейблы для вывода (Original / Diff / FPS) ===
         self.labelOrig = QLabel("No camera")
@@ -294,6 +302,10 @@ class CameraApp(QWidget):
         rowExposure = QHBoxLayout()
         rowExposure.addWidget(self.labelExposure)
         rowExposure.addWidget(self.sliderExposure)
+        
+        rowGain = QHBoxLayout()
+        rowGain.addWidget(self.labelGain)
+        rowGain.addWidget(self.sliderGain)
 
         rowImages = QHBoxLayout()
         rowImages.addWidget(self.labelOrig)
@@ -303,6 +315,7 @@ class CameraApp(QWidget):
         layout.addLayout(row1)
         layout.addLayout(row2)
         layout.addLayout(rowExposure)
+        layout.addLayout(rowGain)
         layout.addLayout(rowImages)
         layout.addWidget(self.labelFps)
 
@@ -317,6 +330,15 @@ class CameraApp(QWidget):
                 print(f"Exposure set to {value} us")
             else:
                 print("Failed to set exposure, error code:", err)
+
+    def on_gain_slider_changed(self, value):
+        self.labelGain.setText(f"Gain: {value}")
+        if self.hCamera:
+            err = mvsdk.CameraSetAnalogGain(self.hCamera, int(value))
+            if err == 0:
+                print(f"Analog gain set to {value}")
+            else:
+                print("Failed to set analog gain, error code:", err)
 
     def on_open_camera(self):
         idx = self.comboCamera.currentIndex()
@@ -345,6 +367,7 @@ class CameraApp(QWidget):
         mvsdk.CameraSetTriggerMode(self.hCamera, 0)
         mvsdk.CameraSetAeState(self.hCamera, 0)
         mvsdk.CameraSetExposureTime(self.hCamera, self.sliderExposure.value())
+        mvsdk.CameraSetAnalogGain(self.hCamera, self.sliderGain.value())
 
         mvsdk.CameraPlay(self.hCamera)
 

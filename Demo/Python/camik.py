@@ -197,7 +197,7 @@ class CameraApp(QWidget):
         self.is_recording = False
         self.writer_orig = None
         self.writer_diff = None
-        self.video_fps = 60.0  # FPS для записи
+        self.video_fps = 30.0  # FPS для записи
         self.video_size = None  # (width, height) — определяется при первом кадре
 
         self.worker = None  # Поток для захвата кадров
@@ -273,6 +273,18 @@ class CameraApp(QWidget):
         self.sliderGain.setTickInterval(1)
         self.sliderGain.valueChanged.connect(self.on_gain_slider_changed)
 
+        # === Панель для управления стробом (триггерный выход камеры) ===
+        self.checkStrobe = QCheckBox("Strobe Enable")
+        self.checkStrobe.setChecked(False)
+        self.editStrobeDelay = QLineEdit("0")
+        self.editStrobeDelay.setFixedWidth(80)
+        self.editStrobePulse = QLineEdit("1000")
+        self.editStrobePulse.setFixedWidth(80)
+        self.editStrobePolarity = QLineEdit("0")
+        self.editStrobePolarity.setFixedWidth(80)
+        self.btnApplyStrobe = QPushButton("Apply Strobe Settings")
+        self.btnApplyStrobe.clicked.connect(self.on_apply_strobe_settings)
+
         # === Лейблы для вывода (Original / Diff / FPS) ===
         self.labelOrig = QLabel("No camera")
         self.labelOrig.setScaledContents(True)
@@ -283,7 +295,7 @@ class CameraApp(QWidget):
 
         self.labelFps = QLabel("FPS: 0.0")
 
-        # Layout
+        # Layouts
         row1 = QHBoxLayout()
         row1.addWidget(self.comboCamera)
         row1.addWidget(self.comboLoadMode)
@@ -307,6 +319,17 @@ class CameraApp(QWidget):
         rowGain.addWidget(self.labelGain)
         rowGain.addWidget(self.sliderGain)
 
+        # Новая строка для настроек строба
+        rowStrobe = QHBoxLayout()
+        rowStrobe.addWidget(self.checkStrobe)
+        rowStrobe.addWidget(QLabel("Delay (us):"))
+        rowStrobe.addWidget(self.editStrobeDelay)
+        rowStrobe.addWidget(QLabel("Pulse (us):"))
+        rowStrobe.addWidget(self.editStrobePulse)
+        rowStrobe.addWidget(QLabel("Polarity:"))
+        rowStrobe.addWidget(self.editStrobePolarity)
+        rowStrobe.addWidget(self.btnApplyStrobe)
+
         rowImages = QHBoxLayout()
         rowImages.addWidget(self.labelOrig)
         rowImages.addWidget(self.labelDiff)
@@ -316,6 +339,7 @@ class CameraApp(QWidget):
         layout.addLayout(row2)
         layout.addLayout(rowExposure)
         layout.addLayout(rowGain)
+        layout.addLayout(rowStrobe)  # добавляем панель строб-настроек
         layout.addLayout(rowImages)
         layout.addWidget(self.labelFps)
 
@@ -471,6 +495,36 @@ class CameraApp(QWidget):
                 print("Hardware Trigger OFF => Continuous ON")
             else:
                 print("CameraSetTriggerMode(0) failed:", err)
+
+    def on_apply_strobe_settings(self):
+        if not self.hCamera:
+            return
+        strobe_enabled = self.checkStrobe.isChecked()
+        ret_mode = mvsdk.CameraSetStrobeMode(self.hCamera, 1 if strobe_enabled else 0)
+        if ret_mode != 0:
+            print("CameraSetStrobeMode failed:", ret_mode)
+        try:
+            delay = int(self.editStrobeDelay.text())
+            ret_delay = mvsdk.CameraSetStrobeDelayTime(self.hCamera, delay)
+            if ret_delay != 0:
+                print("CameraSetStrobeDelayTime failed:", ret_delay)
+        except ValueError:
+            print("Invalid strobe delay value")
+        try:
+            pulse = int(self.editStrobePulse.text())
+            ret_pulse = mvsdk.CameraSetStrobePulseWidth(self.hCamera, pulse)
+            if ret_pulse != 0:
+                print("CameraSetStrobePulseWidth failed:", ret_pulse)
+        except ValueError:
+            print("Invalid strobe pulse value")
+        try:
+            polarity = int(self.editStrobePolarity.text())
+            ret_pol = mvsdk.CameraSetStrobePolarity(self.hCamera, polarity)
+            if ret_pol != 0:
+                print("CameraSetStrobePolarity failed:", ret_pol)
+        except ValueError:
+            print("Invalid strobe polarity value")
+        print("Strobe settings applied.")
 
     def on_record_clicked(self):
         if not self.is_recording:

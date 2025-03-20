@@ -5,13 +5,13 @@ import re
 import cv2
 import numpy as np
 import mvsdk
-from ultralytics import YOLO  # добавляем YOLOv8
+from ultralytics import YOLO  # для YOLOv8
 
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QComboBox, QPushButton,
     QVBoxLayout, QHBoxLayout, QLineEdit, QCheckBox, QSlider
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt5.QtGui import QImage, QPixmap
 
 def parse_config_file(file_path):
@@ -43,8 +43,50 @@ def convert_frame_to_qpixmap(frame):
         qimg = QImage(rgb_data, w, h, bytes_per_line, QImage.Format_RGB888)
     return QPixmap.fromImage(qimg)
 
+class YOLOWorker(QThread):
+    yoloResult = pyqtSignal(QPixmap)
+    
+    def __init__(self, yolo_model):
+        super().__init__()
+        self.yolo_model = yolo_model
+        self.frame = None
+        self.running = True
+
+    @pyqtSlot(np.ndarray)
+    def updateFrame(self, frame):
+        # Принимаем только последний кадр для обработки
+        self.frame = frame
+
+    def run(self):
+        while self.running:
+            if self.frame is not None:
+                frame_to_process = self.frame.copy()
+                self.frame = None
+                try:
+                    results = self.yolo_model(frame_to_process)
+                    boxes = results[0].boxes
+                    for box in boxes:
+                        coords = box.xyxy[0]
+                        x1, y1, x2, y2 = int(coords[0].item()), int(coords[1].item()), int(coords[2].item()), int(coords[3].item())
+                        cls_id = int(box.cls[0].item())
+                        conf = float(box.conf[0].item())
+                        label = f"{self.yolo_model.model.names[cls_id]} {conf:.2f}"
+                        cv2.rectangle(frame_to_process, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                        cv2.putText(frame_to_process, label, (x1, max(y1-10, 0)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                except Exception as e:
+                    print("YOLO detection error in worker:", e)
+                pix = convert_frame_to_qpixmap(frame_to_process)
+                self.yoloResult.emit(pix)
+            self.msleep(10)
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
 class CameraWorker(QThread):
     updateFrameSignal = pyqtSignal(QPixmap, QPixmap, float)
+    sendFrameForYOLO = pyqtSignal(np.ndarray)
     
     def __init__(self, camera_app):
         super().__init__()
@@ -65,112 +107,79 @@ class CameraWorker(QThread):
                     self.frame_count = 0
                     self.prev_time = current_time
 
-                if self.camera_app.flash_period > 0:
-                    phase = (current_time % self.camera_app.flash_period) / self.camera_app.flash_period
+                # Различаем режимы: вебкамера или mvsdk-камера
+                if self.camera_app.camera_type == 'webcam':
+                    ret, frame_bgr = self.camera_app.cap.read()
+                    if not ret:
+                        continue
+                    # Если video_size ещё не задан, определяем его
+                    if self.camera_app.video_size is None:
+                        h = int(self.camera_app.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        w = int(self.camera_app.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        self.camera_app.video_size = (w, h)
                 else:
-                    phase = 0.0
+                    # mvsdk-режим
+                    pRawData, FrameHead = mvsdk.CameraGetImageBuffer(self.camera_app.hCamera, 50)
+                    mvsdk.CameraImageProcess(self.camera_app.hCamera, pRawData, self.camera_app.pFrameBuffer, FrameHead)
+                    mvsdk.CameraReleaseImageBuffer(self.camera_app.hCamera, pRawData)
 
-                # Захват и обработка кадра
-                pRawData, FrameHead = mvsdk.CameraGetImageBuffer(self.camera_app.hCamera, 50)
-                mvsdk.CameraImageProcess(self.camera_app.hCamera, pRawData, self.camera_app.pFrameBuffer, FrameHead)
-                mvsdk.CameraReleaseImageBuffer(self.camera_app.hCamera, pRawData)
+                    if platform.system() == "Windows":
+                        mvsdk.CameraFlipFrameBuffer(self.camera_app.pFrameBuffer, FrameHead, 1)
 
-                if platform.system() == "Windows":
-                    mvsdk.CameraFlipFrameBuffer(self.camera_app.pFrameBuffer, FrameHead, 1)
+                    frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(self.camera_app.pFrameBuffer)
+                    frame = np.frombuffer(frame_data, dtype=np.uint8)
+                    ch = 1 if (FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8) else 3
+                    frame_bgr = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, ch))
+                    if ch == 1:
+                        frame_bgr = cv2.cvtColor(frame_bgr, cv2.COLOR_GRAY2BGR)
+                    else:
+                        frame_bgr = frame_bgr.copy()
+                    # Определяем размер видео при первом кадре
+                    if self.camera_app.video_size is None:
+                        h, w = frame_bgr.shape[:2]
+                        self.camera_app.video_size = (w, h)
 
-                frame_data = (mvsdk.c_ubyte * FrameHead.uBytes).from_address(self.camera_app.pFrameBuffer)
-                frame = np.frombuffer(frame_data, dtype=np.uint8)
-                ch = 1 if (FrameHead.uiMediaType == mvsdk.CAMERA_MEDIA_TYPE_MONO8) else 3
-                frame = frame.reshape((FrameHead.iHeight, FrameHead.iWidth, ch))
-
-                if self.camera_app.video_size is None:
-                    h, w = frame.shape[:2]
-                    self.camera_app.video_size = (w, h)
-                    if (self.camera_app.is_recording and 
-                        self.camera_app.writer_orig and 
-                        self.camera_app.writer_diff):
-                        self.camera_app.writer_orig.release()
-                        self.camera_app.writer_diff.release()
-                        fourcc = cv2.VideoWriter_fourcc(*'XVID')
-                        time_str = time.strftime("%Y%m%d_%H%M%S")
-                        filename_orig = f"orig_{time_str}.avi"
-                        filename_diff = f"diff_{time_str}.avi"
-                        print("Adjusting video size to:", self.camera_app.video_size)
-                        self.camera_app.writer_orig = cv2.VideoWriter(
-                            filename_orig, fourcc, self.camera_app.video_fps, self.camera_app.video_size
-                        )
-                        self.camera_app.writer_diff = cv2.VideoWriter(
-                            filename_diff, fourcc, self.camera_app.video_fps, self.camera_app.video_size
-                        )
-
-                if ch == 1:
-                    frame_bgr = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-                else:
-                    frame_bgr = frame.copy()
-
+                # Добавляем на кадр только FPS
                 cv2.putText(frame_bgr, f"FPS: {self.fps:.2f}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-                cv2.putText(frame_bgr, f"Phase: {phase:.2f}", (10, 70),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-                cv2.putText(frame_bgr, f"FlashFreq: {self.camera_app.flash_freq:.2f}", (10, 110),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-                # Если YOLO включена, запускаем детекцию и отрисовываем боксы
-                if self.camera_app.yolo_enabled and self.camera_app.yolo_model is not None:
-                    try:
-                        results = self.camera_app.yolo_model(frame_bgr)
-                        # Предполагается, что передаётся одно изображение, поэтому берем results[0]
-                        boxes = results[0].boxes
-                        for box in boxes:
-                            # Извлекаем координаты, класс и уверенность
-                            coords = box.xyxy[0]
-                            x1, y1, x2, y2 = int(coords[0].item()), int(coords[1].item()), int(coords[2].item()), int(coords[3].item())
-                            cls_id = int(box.cls[0].item())
-                            conf = float(box.conf[0].item())
-                            # Используем имена классов из модели (обычно в self.yolo_model.model.names)
-                            label = f"{self.camera_app.yolo_model.model.names[cls_id]} {conf:.2f}"
-                            cv2.rectangle(frame_bgr, (x1, y1), (x2, y2), (0,0,255), 2)
-                            cv2.putText(frame_bgr, label, (x1, max(y1-10, 0)),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-                    except Exception as e:
-                        print("YOLO detection error:", e)
+                # Если YOLO включена, передаём кадр в YOLOWorker
+                if self.camera_app.yolo_enabled and self.camera_app.yolo_worker is not None:
+                    self.sendFrameForYOLO.emit(frame_bgr.copy())
 
                 pix_orig = convert_frame_to_qpixmap(frame_bgr)
 
+                # Разница кадров (Difference Mode)
                 if self.camera_app.checkDiff.isChecked():
                     if self.prev_frame is not None:
                         diff = cv2.absdiff(frame_bgr, self.prev_frame)
                         cv2.putText(diff, f"FPS: {self.fps:.2f}", (10, 30),
                                     cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-                        cv2.putText(diff, f"Phase: {phase:.2f}", (10, 70),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
-                        cv2.putText(diff, f"FlashFreq: {self.camera_app.flash_freq:.2f}", (10, 110),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
                         pix_diff = convert_frame_to_qpixmap(diff)
-                        diff_frame = diff
                     else:
                         pix_diff = QPixmap()
-                        diff_frame = np.zeros_like(frame_bgr)
+                    self.prev_frame = frame_bgr.copy()
                 else:
                     pix_diff = QPixmap()
-                    diff_frame = np.zeros_like(frame_bgr)
 
-                self.prev_frame = frame_bgr.copy()
-
+                # Запись видео, если включена
                 if (self.camera_app.is_recording and self.camera_app.writer_orig and 
                     self.camera_app.writer_diff and self.camera_app.video_size):
                     if (frame_bgr.shape[1], frame_bgr.shape[0]) != self.camera_app.video_size:
                         frame_bgr = cv2.resize(frame_bgr, self.camera_app.video_size)
-                    if (diff_frame.shape[1], diff_frame.shape[0]) != self.camera_app.video_size:
-                        diff_frame = cv2.resize(diff_frame, self.camera_app.video_size)
+                    # Если используется diff-режим, делаем то же
                     self.camera_app.writer_orig.write(frame_bgr)
-                    self.camera_app.writer_diff.write(diff_frame)
+                    if not self.camera_app.checkDiff.isChecked():
+                        # Если diff mode выключен – записываем пустой кадр или копию
+                        self.camera_app.writer_diff.write(frame_bgr)
+                    else:
+                        diff_frame = cv2.absdiff(frame_bgr, self.prev_frame)
+                        self.camera_app.writer_diff.write(diff_frame)
 
                 self.updateFrameSignal.emit(pix_orig, pix_diff, self.fps)
 
-            except mvsdk.CameraException as e:
-                if e.error_code != mvsdk.CAMERA_STATUS_TIME_OUT:
-                    print("CameraGetImageBuffer failed:", e)
+            except Exception as e:
+                print("Error in CameraWorker:", e)
 
     def stop(self):
         self.running = False
@@ -179,52 +188,64 @@ class CameraWorker(QThread):
 class CameraApp(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MvSDK + PyQt (Resolution, Config, Diff, Trigger, Recording with Time)")
+        self.setWindowTitle("MvSDK + PyQt (Выбор камеры, настройка FPS, YOLO, Diff, Trigger, Recording)")
         
-        # --- Камера/буфер/параметры ---
-        self.hCamera = None
+        # --- Переменные для камеры ---
+        self.hCamera = None          # mvsdk-камера
+        self.cap = None              # cv2.VideoCapture для вебкамеры
+        self.camera_type = None      # 'mvsdk' или 'webcam'
         self.capability = None
         self.monoCamera = False
         self.pFrameBuffer = None
         self.FrameBufferSize = 0
 
         # Списки устройств
-        self.devList = mvsdk.CameraEnumerateDevice()
+        self.devList = mvsdk.CameraEnumerateDevice()  # устройства mvsdk
+        self.webcamList = self.enumerate_webcams()      # список обнаруженных вебкамер
         self.resList = []
         self.loadModes = [("ByModel", 0), ("ByName", 1), ("BySN", 2)]
 
-        # --- Чтение config (ROI, exp_time, etc.) ---
+        # --- Чтение конфигурации ---
         self.config_file_path = "settings.Config"
         self.config_params = {}
         self.load_config()
 
-        # --- Параметры для FPS ---
+        # --- Параметры FPS и видео ---
         self.frame_count = 0
         self.prev_time = time.time()
         self.fps = 0.0
+        self.video_fps = 30.0  # по умолчанию, но может изменяться через GUI
+        self.video_size = None
 
-        # --- Параметры фонарика ---
+        # --- Другие параметры ---
         self.flash_freq = 10.0
         self.flash_period = 1.0 / self.flash_freq
-        self.phase = 0.0
-
-        # --- Для Difference Mode ---
         self.prev_frame = None
-
-        # --- Для записи видео ---
         self.is_recording = False
         self.writer_orig = None
         self.writer_diff = None
-        self.video_fps = 30.0  # FPS для записи
-        self.video_size = None  # (width, height) – определяется при первом кадре
 
-        self.worker = None  # Поток для захвата кадров
+        self.worker = None  # поток захвата кадров
 
         # --- Параметры YOLO ---
         self.yolo_enabled = False
         self.yolo_model = None
+        self.yolo_worker = None
 
         self.initUI()
+
+    def enumerate_webcams(self):
+        webcams = []
+        # Пробуем индексы от 0 до 3
+        for i in range(4):
+            cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                ret, frame = cap.read()
+                if ret:
+                    webcams.append(i)
+                cap.release()
+        print("Обнаруженные веб-камеры:", webcams)
+        return webcams
 
     def load_config(self):
         try:
@@ -235,22 +256,26 @@ class CameraApp(QWidget):
             self.config_params = {}
 
     def initUI(self):
-        # === Выбор камеры ===
+        # === Комбобокс для выбора камеры ===
         self.comboCamera = QComboBox()
+        # Добавляем сначала веб-камеры (если есть)
+        for idx in self.webcamList:
+            self.comboCamera.addItem(f"Webcam {idx}", {"type": "webcam", "index": idx})
+        # Затем добавляем устройства mvsdk
         for i, dev in enumerate(self.devList):
-            txt = f"{i}: {dev.GetFriendlyName()} (SN:{dev.GetSn()})"
-            self.comboCamera.addItem(txt)
+            desc = f"{i}: {dev.GetFriendlyName()} (SN:{dev.GetSn()})"
+            self.comboCamera.addItem(desc, {"type": "mvsdk", "device": dev})
 
-        # === Выбор LoadMode ===
+        # === Выбор LoadMode для mvsdk (только если mvsdk-камера) ===
         self.comboLoadMode = QComboBox()
         for (name, val) in self.loadModes:
             self.comboLoadMode.addItem(name, val)
 
-        # === Кнопка Open ===
+        # === Кнопка открытия камеры ===
         self.btnOpen = QPushButton("Open Camera")
         self.btnOpen.clicked.connect(self.on_open_camera)
 
-        # === ComboBox разрешений + кнопка SetRes ===
+        # === ComboBox разрешений + кнопка SetRes (применяются только для mvsdk) ===
         self.comboRes = QComboBox()
         self.btnSetRes = QPushButton("Set Resolution")
         self.btnSetRes.clicked.connect(self.on_set_resolution)
@@ -259,30 +284,35 @@ class CameraApp(QWidget):
         self.btnApplyConf = QPushButton("Apply Config")
         self.btnApplyConf.clicked.connect(self.on_apply_config)
 
-        # === Поле ввода частоты фонарика ===
+        # === Поле ввода частоты фонарика (осталось для совместимости) ===
         self.editFreq = QLineEdit(str(self.flash_freq))
         self.editFreq.setFixedWidth(60)
         self.editFreq.editingFinished.connect(self.on_freq_changed)
 
-        # === CheckBox Diff Mode ===
+        # === Поле ввода Video FPS ===
+        self.editVideoFPS = QLineEdit(str(self.video_fps))
+        self.editVideoFPS.setFixedWidth(60)
+        self.editVideoFPS.editingFinished.connect(self.on_video_fps_changed)
+
+        # === CheckBox для Difference Mode ===
         self.checkDiff = QCheckBox("Difference Mode")
         self.checkDiff.setChecked(False)
 
-        # === CheckBox Hardware Trigger ===
+        # === CheckBox для Hardware Trigger ===
         self.checkHardwareTrigger = QCheckBox("Hardware Trigger")
         self.checkHardwareTrigger.setChecked(False)
         self.checkHardwareTrigger.stateChanged.connect(self.on_trigger_mode_changed)
 
-        # === Кнопка Record (Start/Stop) ===
+        # === Кнопка записи (Start/Stop) ===
         self.btnRecord = QPushButton("Start Recording")
         self.btnRecord.clicked.connect(self.on_record_clicked)
         
-        # === Новая кнопка для YOLO (включения/отключения детекции) ===
+        # === Кнопка для YOLO (включение/отключение) ===
         self.btnYOLO = QPushButton("Enable YOLO")
         self.btnYOLO.setCheckable(True)
         self.btnYOLO.clicked.connect(self.on_yolo_clicked)
 
-        # === Регулировка экспозиции через слайдер ===
+        # === Слайдеры для экспозиции и усиления ===
         self.labelExposure = QLabel("Exposure: 30000 us")
         self.sliderExposure = QSlider(Qt.Horizontal)
         self.sliderExposure.setMinimum(100)
@@ -291,7 +321,6 @@ class CameraApp(QWidget):
         self.sliderExposure.setTickInterval(10000)
         self.sliderExposure.valueChanged.connect(self.on_exposure_slider_changed)
         
-        # === Регулировка усиления (analog gain) через слайдер ===
         self.labelGain = QLabel("Gain: 1")
         self.sliderGain = QSlider(Qt.Horizontal)
         self.sliderGain.setMinimum(1)
@@ -300,7 +329,7 @@ class CameraApp(QWidget):
         self.sliderGain.setTickInterval(1)
         self.sliderGain.valueChanged.connect(self.on_gain_slider_changed)
 
-        # === Панель для управления стробом ===
+        # === Панель строб-настроек ===
         self.checkStrobe = QCheckBox("Strobe Enable")
         self.checkStrobe.setChecked(False)
         self.editStrobeDelay = QLineEdit("0")
@@ -312,9 +341,9 @@ class CameraApp(QWidget):
         self.btnApplyStrobe = QPushButton("Apply Strobe Settings")
         self.btnApplyStrobe.clicked.connect(self.on_apply_strobe_settings)
 
-        # === Лейблы для вывода (Original / Diff / FPS) ===
+        # === Лейблы для отображения изображений ===
         self.labelOrig = QLabel("No camera")
-        self.labelOrig.setScaledContents(True)
+        self.labelOrig.setScaledContents(False)  # масштабируем вручную
 
         self.labelDiff = QLabel("Diff off")
         self.labelDiff.setScaledContents(True)
@@ -322,7 +351,7 @@ class CameraApp(QWidget):
 
         self.labelFps = QLabel("FPS: 0.0")
 
-        # Layouts
+        # === Раскладка элементов ===
         row1 = QHBoxLayout()
         row1.addWidget(self.comboCamera)
         row1.addWidget(self.comboLoadMode)
@@ -334,10 +363,12 @@ class CameraApp(QWidget):
         row2.addWidget(self.btnApplyConf)
         row2.addWidget(QLabel("FlashFreq:"))
         row2.addWidget(self.editFreq)
+        row2.addWidget(QLabel("Video FPS:"))
+        row2.addWidget(self.editVideoFPS)
         row2.addWidget(self.checkDiff)
         row2.addWidget(self.checkHardwareTrigger)
         row2.addWidget(self.btnRecord)
-        row2.addWidget(self.btnYOLO)  # добавляем кнопку YOLO
+        row2.addWidget(self.btnYOLO)
 
         rowExposure = QHBoxLayout()
         rowExposure.addWidget(self.labelExposure)
@@ -375,7 +406,7 @@ class CameraApp(QWidget):
 
     def on_exposure_slider_changed(self, value):
         self.labelExposure.setText(f"Exposure: {value} us")
-        if self.hCamera:
+        if self.camera_type == 'mvsdk' and self.hCamera:
             err = mvsdk.CameraSetExposureTime(self.hCamera, value)
             if err == 0:
                 print(f"Exposure set to {value} us")
@@ -384,75 +415,98 @@ class CameraApp(QWidget):
 
     def on_gain_slider_changed(self, value):
         self.labelGain.setText(f"Gain: {value}")
-        if self.hCamera:
+        if self.camera_type == 'mvsdk' and self.hCamera:
             err = mvsdk.CameraSetAnalogGain(self.hCamera, int(value))
             if err == 0:
                 print(f"Analog gain set to {value}")
             else:
                 print("Failed to set analog gain, error code:", err)
 
-    def on_open_camera(self):
-        idx = self.comboCamera.currentIndex()
-        if idx < 0 or idx >= len(self.devList):
-            return
-        DevInfo = self.devList[idx]
-        loadMode = self.comboLoadMode.currentData()  # 0,1,2
-
-        self.close_camera()
-
+    def on_video_fps_changed(self):
+        txt = self.editVideoFPS.text().strip()
         try:
-            self.hCamera = mvsdk.CameraInit(DevInfo, loadMode, -1)
-        except mvsdk.CameraException as e:
-            print("CameraInit failed:", e)
-            self.hCamera = None
+            val = float(txt)
+            if val > 0:
+                self.video_fps = val
+                print(f"Video FPS set to {val}")
+        except ValueError:
+            print("Invalid Video FPS input")
+
+    def on_open_camera(self):
+        selected = self.comboCamera.currentData()
+        if not selected:
             return
+        self.close_camera()  # закрываем предыдущую камеру, если открыта
 
-        self.capability = mvsdk.CameraGetCapability(self.hCamera)
-        self.monoCamera = (self.capability.sIspCapacity.bMonoSensor != 0)
-
-        if self.monoCamera:
-            mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
+        if selected["type"] == "webcam":
+            self.camera_type = "webcam"
+            webcam_index = selected["index"]
+            self.cap = cv2.VideoCapture(webcam_index)
+            if not self.cap.isOpened():
+                print(f"Не удалось открыть веб-камеру {webcam_index}")
+                return
+            # Определяем video_size по первому кадру
+            ret, frame = self.cap.read()
+            if ret:
+                h, w = frame.shape[:2]
+                self.video_size = (w, h)
+            print(f"Webcam {webcam_index} opened successfully.")
         else:
-            mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
+            self.camera_type = "mvsdk"
+            dev = selected["device"]
+            loadMode = self.comboLoadMode.currentData()
+            try:
+                self.hCamera = mvsdk.CameraInit(dev, loadMode, -1)
+            except mvsdk.CameraException as e:
+                print("CameraInit failed:", e)
+                self.hCamera = None
+                return
 
-        mvsdk.CameraSetTriggerMode(self.hCamera, 0)
-        mvsdk.CameraSetAeState(self.hCamera, 0)
-        mvsdk.CameraSetExposureTime(self.hCamera, self.sliderExposure.value())
-        mvsdk.CameraSetAnalogGain(self.hCamera, self.sliderGain.value())
+            self.capability = mvsdk.CameraGetCapability(self.hCamera)
+            self.monoCamera = (self.capability.sIspCapacity.bMonoSensor != 0)
+            if self.monoCamera:
+                mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_MONO8)
+            else:
+                mvsdk.CameraSetIspOutFormat(self.hCamera, mvsdk.CAMERA_MEDIA_TYPE_BGR8)
 
-        mvsdk.CameraPlay(self.hCamera)
+            mvsdk.CameraSetTriggerMode(self.hCamera, 0)
+            mvsdk.CameraSetAeState(self.hCamera, 0)
+            mvsdk.CameraSetExposureTime(self.hCamera, self.sliderExposure.value())
+            mvsdk.CameraSetAnalogGain(self.hCamera, self.sliderGain.value())
+            mvsdk.CameraPlay(self.hCamera)
 
-        maxw = self.capability.sResolutionRange.iWidthMax
-        maxh = self.capability.sResolutionRange.iHeightMax
-        ch = 1 if self.monoCamera else 3
-        self.FrameBufferSize = maxw * maxh * ch
-        self.pFrameBuffer = mvsdk.CameraAlignMalloc(self.FrameBufferSize, 16)
+            maxw = self.capability.sResolutionRange.iWidthMax
+            maxh = self.capability.sResolutionRange.iHeightMax
+            ch = 1 if self.monoCamera else 3
+            self.FrameBufferSize = maxw * maxh * ch
+            self.pFrameBuffer = mvsdk.CameraAlignMalloc(self.FrameBufferSize, 16)
+            self.comboRes.clear()
+            self.resList.clear()
+            count = self.capability.iImageSizeDesc
+            pResDesc = self.capability.pImageSizeDesc
+            for i in range(count):
+                r = pResDesc[i]
+                desc = r.GetDescription()
+                w = r.iWidthFOV
+                h = r.iHeightFOV
+                text = f"{desc} ({w}x{h})"
+                self.comboRes.addItem(text)
+                self.resList.append(r.clone())
+            print("mvsdk камера открыта успешно.")
+            self.video_size = None  # будет определён при первом кадре
 
-        self.comboRes.clear()
-        self.resList.clear()
-        count = self.capability.iImageSizeDesc
-        pResDesc = self.capability.pImageSizeDesc
-        for i in range(count):
-            r = pResDesc[i]
-            desc = r.GetDescription()
-            w = r.iWidthFOV
-            h = r.iHeightFOV
-            text = f"{desc} ({w}x{h})"
-            self.comboRes.addItem(text)
-            self.resList.append(r.clone())
-
-        print("Camera opened OK.")
-        self.prev_frame = None
-        self.video_size = None
-
+        # Запускаем поток захвата кадров
         if self.worker:
             self.worker.stop()
         self.worker = CameraWorker(self)
         self.worker.updateFrameSignal.connect(self.on_update_frame)
+        self.worker.sendFrameForYOLO.connect(lambda frame: 
+                                             self.yolo_worker.updateFrame(frame)
+                                             if self.yolo_worker is not None else None)
         self.worker.start()
 
     def on_set_resolution(self):
-        if not self.hCamera:
+        if self.camera_type != 'mvsdk' or not self.hCamera:
             return
         idxRes = self.comboRes.currentIndex()
         if idxRes < 0 or idxRes >= len(self.resList):
@@ -466,7 +520,7 @@ class CameraApp(QWidget):
             print("CameraSetImageResolution failed:", err)
 
     def on_apply_config(self):
-        if not self.hCamera:
+        if self.camera_type != 'mvsdk' or not self.hCamera:
             return
         cfg = self.config_params
         iIndex = cfg.get("iIndex", None)
@@ -507,7 +561,7 @@ class CameraApp(QWidget):
             print("Invalid freq input")
 
     def on_trigger_mode_changed(self, state):
-        if not self.hCamera:
+        if self.camera_type != 'mvsdk' or not self.hCamera:
             return
         if state == Qt.Checked:
             err = mvsdk.CameraSetTriggerMode(self.hCamera, 2)
@@ -523,7 +577,7 @@ class CameraApp(QWidget):
                 print("CameraSetTriggerMode(0) failed:", err)
 
     def on_apply_strobe_settings(self):
-        if not self.hCamera:
+        if self.camera_type != 'mvsdk' or not self.hCamera:
             return
         strobe_enabled = self.checkStrobe.isChecked()
         ret_mode = mvsdk.CameraSetStrobeMode(self.hCamera, 1 if strobe_enabled else 0)
@@ -566,7 +620,7 @@ class CameraApp(QWidget):
         filename_orig = f"orig_{time_str}.avi"
         filename_diff = f"diff_{time_str}.avi"
         print(f"Start recording to {filename_orig} and {filename_diff}")
-        self.video_size = None
+        self.video_size = None  # будет определён в потоке
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
         self.writer_orig = cv2.VideoWriter(filename_orig, fourcc, self.video_fps, (640,480))
         self.writer_diff = cv2.VideoWriter(filename_diff, fourcc, self.video_fps, (640,480))
@@ -581,41 +635,64 @@ class CameraApp(QWidget):
             self.writer_diff = None
         print("Recording stopped.")
 
+    @pyqtSlot(QPixmap, QPixmap, float)
+    def on_update_frame(self, pix_orig, pix_diff, fps):
+        # Если YOLO выключена – выводим масштабированное изображение,
+        # иначе результат от YOLO выводится в отдельном слоте
+        if not self.yolo_enabled:
+            scaled = pix_orig.scaled(self.labelOrig.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.labelOrig.setPixmap(scaled)
+        if self.checkDiff.isChecked():
+            scaled_diff = pix_diff.scaled(self.labelDiff.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            self.labelDiff.setVisible(True)
+            self.labelDiff.setPixmap(scaled_diff)
+        else:
+            self.labelDiff.setVisible(False)
+        self.labelFps.setText(f"FPS: {fps:.2f}")
+
+    @pyqtSlot(QPixmap)
+    def on_yolo_result(self, pix):
+        scaled = pix.scaled(self.labelOrig.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.labelOrig.setPixmap(scaled)
+
     def on_yolo_clicked(self):
-        # Переключаем режим YOLO
         self.yolo_enabled = self.btnYOLO.isChecked()
         if self.yolo_enabled:
             self.btnYOLO.setText("Disable YOLO")
-            # Загружаем модель, если ещё не загружена
             if self.yolo_model is None:
                 try:
-                    self.yolo_model = YOLO("yolov8n.pt")  # можно выбрать другую модель
+                    self.yolo_model = YOLO("yolov8n.pt")
                     print("YOLOv8 model loaded.")
                 except Exception as e:
                     print("Failed to load YOLO model:", e)
                     self.yolo_enabled = False
                     self.btnYOLO.setChecked(False)
                     self.btnYOLO.setText("Enable YOLO")
+                    return
+            if self.yolo_worker is None:
+                self.yolo_worker = YOLOWorker(self.yolo_model)
+                self.yolo_worker.yoloResult.connect(self.on_yolo_result)
+                self.yolo_worker.start()
         else:
             self.btnYOLO.setText("Enable YOLO")
-
-    def on_update_frame(self, pix_orig, pix_diff, fps):
-        self.labelOrig.setPixmap(pix_orig)
-        if self.checkDiff.isChecked():
-            self.labelDiff.setVisible(True)
-            self.labelDiff.setPixmap(pix_diff)
-        else:
-            self.labelDiff.setVisible(False)
-        self.labelFps.setText(f"FPS: {fps:.2f}")
+            if self.yolo_worker is not None:
+                self.yolo_worker.stop()
+                self.yolo_worker = None
 
     def close_camera(self):
         self.stop_recording()
         if self.worker:
             self.worker.stop()
             self.worker = None
-        if self.hCamera:
+        if self.yolo_worker:
+            self.yolo_worker.stop()
+            self.yolo_worker = None
+        if self.camera_type == "mvsdk" and self.hCamera:
             mvsdk.CameraUnInit(self.hCamera)
             self.hCamera = None
+        if self.camera_type == "webcam" and self.cap:
+            self.cap.release()
+            self.cap = None
         if self.pFrameBuffer:
             mvsdk.CameraAlignFree(self.pFrameBuffer)
             self.pFrameBuffer = None

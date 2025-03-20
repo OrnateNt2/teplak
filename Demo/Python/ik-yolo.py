@@ -346,7 +346,7 @@ class CameraApp(QWidget):
         self.labelOrig.setScaledContents(False)  # масштабируем вручную
 
         self.labelDiff = QLabel("Diff off")
-        self.labelDiff.setScaledContents(True)
+        self.labelDiff.setScaledContents(False)
         self.labelDiff.setVisible(False)
 
         self.labelFps = QLabel("FPS: 0.0")
@@ -637,18 +637,18 @@ class CameraApp(QWidget):
 
     @pyqtSlot(QPixmap, QPixmap, float)
     def on_update_frame(self, pix_orig, pix_diff, fps):
-        # Если YOLO выключена – выводим масштабированное изображение,
-        # иначе результат от YOLO выводится в отдельном слоте
         if not self.yolo_enabled:
             scaled = pix_orig.scaled(self.labelOrig.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.labelOrig.setPixmap(scaled)
         if self.checkDiff.isChecked():
+            # Ручное масштабирование diff изображения с сохранением пропорций
             scaled_diff = pix_diff.scaled(self.labelDiff.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.labelDiff.setVisible(True)
             self.labelDiff.setPixmap(scaled_diff)
         else:
             self.labelDiff.setVisible(False)
         self.labelFps.setText(f"FPS: {fps:.2f}")
+
 
     @pyqtSlot(QPixmap)
     def on_yolo_result(self, pix):

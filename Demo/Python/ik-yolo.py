@@ -281,6 +281,13 @@ class CameraApp(QWidget):
         self.btnYOLO = QPushButton("Enable YOLO")
         self.btnYOLO.setCheckable(True)
         self.btnYOLO.clicked.connect(self.on_yolo_clicked)
+        
+        # Новые виджеты для выбора модели YOLO и использования CUDA
+        self.comboYOLOModel = QComboBox()
+        self.comboYOLOModel.addItem("YOLOv8n.pt")
+        self.comboYOLOModel.addItem("drone_far_yolo11n.pt")
+        self.checkCUDA = QCheckBox("Use CUDA")
+        self.checkCUDA.setChecked(True)
 
         self.labelExposure = QLabel("Exposure: 30000 us")
         self.sliderExposure = QSlider(Qt.Horizontal)
@@ -335,6 +342,10 @@ class CameraApp(QWidget):
         row2.addWidget(self.checkHardwareTrigger)
         row2.addWidget(self.btnRecord)
         row2.addWidget(self.btnYOLO)
+        # Новые элементы для выбора модели YOLO и режима CUDA
+        row2.addWidget(QLabel("YOLO Model:"))
+        row2.addWidget(self.comboYOLOModel)
+        row2.addWidget(self.checkCUDA)
 
         rowExposure = QHBoxLayout()
         rowExposure.addWidget(self.labelExposure)
@@ -612,7 +623,6 @@ class CameraApp(QWidget):
             self.labelDiff.setVisible(False)
         self.labelFps.setText(f"FPS: {fps:.2f}")
 
-
     @pyqtSlot(QPixmap)
     def on_yolo_result(self, pix):
         scaled = pix.scaled(self.labelOrig.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
@@ -623,9 +633,13 @@ class CameraApp(QWidget):
         if self.yolo_enabled:
             self.btnYOLO.setText("Disable YOLO")
             if self.yolo_model is None:
+                model_file = self.comboYOLOModel.currentText()
+                device = "cuda" if self.checkCUDA.isChecked() else "cpu"
                 try:
-                    self.yolo_model = YOLO("yolov8n.pt")
-                    print("YOLOv8 model loaded.")
+                    self.yolo_model = YOLO(model_file)
+                    # Переносим модель на нужное устройство:
+                    self.yolo_model.model.to(device)
+                    print(f"YOLO model {model_file} loaded on device {device}.")
                 except Exception as e:
                     print("Failed to load YOLO model:", e)
                     self.yolo_enabled = False
@@ -641,6 +655,7 @@ class CameraApp(QWidget):
             if self.yolo_worker is not None:
                 self.yolo_worker.stop()
                 self.yolo_worker = None
+
 
     def close_camera(self):
         self.stop_recording()

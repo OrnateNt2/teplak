@@ -134,8 +134,9 @@ class CameraWorker(QThread):
                         h, w = frame_bgr.shape[:2]
                         self.camera_app.video_size = (w, h)
 
-                cv2.putText(frame_bgr, f"FPS: {self.fps:.2f}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                # Убрана отрисовка FPS на кадре:
+                # cv2.putText(frame_bgr, f"FPS: {self.fps:.2f}", (10, 30),
+                #             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
                 if self.camera_app.yolo_enabled and self.camera_app.yolo_worker is not None:
                     self.sendFrameForYOLO.emit(frame_bgr.copy())
@@ -145,8 +146,9 @@ class CameraWorker(QThread):
                 if self.camera_app.checkDiff.isChecked():
                     if self.prev_frame is not None:
                         diff = cv2.absdiff(frame_bgr, self.prev_frame)
-                        cv2.putText(diff, f"FPS: {self.fps:.2f}", (10, 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+                        # Убрана отрисовка FPS на diff-кадре:
+                        # cv2.putText(diff, f"FPS: {self.fps:.2f}", (10, 30),
+                        #             cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
                         pix_diff = convert_frame_to_qpixmap(diff)
                     else:
                         pix_diff = QPixmap()
@@ -282,7 +284,7 @@ class CameraApp(QWidget):
         self.btnYOLO.setCheckable(True)
         self.btnYOLO.clicked.connect(self.on_yolo_clicked)
         
-        # Новые виджеты для выбора модели YOLO и использования CUDA
+        # Виджеты для выбора модели YOLO и использования CUDA
         self.comboYOLOModel = QComboBox()
         self.comboYOLOModel.addItem("YOLOv8n.pt")
         self.comboYOLOModel.addItem("drone_far_yolo11n.pt")
@@ -342,7 +344,6 @@ class CameraApp(QWidget):
         row2.addWidget(self.checkHardwareTrigger)
         row2.addWidget(self.btnRecord)
         row2.addWidget(self.btnYOLO)
-        # Новые элементы для выбора модели YOLO и режима CUDA
         row2.addWidget(QLabel("YOLO Model:"))
         row2.addWidget(self.comboYOLOModel)
         row2.addWidget(self.checkCUDA)
@@ -655,7 +656,6 @@ class CameraApp(QWidget):
             if self.yolo_worker is not None:
                 self.yolo_worker.stop()
                 self.yolo_worker = None
-
 
     def close_camera(self):
         self.stop_recording()

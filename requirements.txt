@@ -1,4 +1,5 @@
 opencv-python
 numpy
-Pillow
-mvsdk
+PyQt5
+ultralytics
+#pip install -r requirements.txt
